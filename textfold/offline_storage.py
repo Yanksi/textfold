@@ -8,7 +8,9 @@ import time
 import uuid
 import zipfile
 
-from .cloud_storage import StorageError
+from .cloud_storage import StorageError, StorageAuthenticationError, StorageIdentityError
+from .change_notifications import ChangeNotifications
+from .sync_schedule import SyncSchedule
 from .documents import ConflictError
 from .sqlite_storage import SQLiteBackend, LIBRARY
 from . import sync_records as records
@@ -33,7 +35,7 @@ def blob_refs(value):
 class OfflineBackend:
     name = "cloud"
 
-    def __init__(self, root, remote):
+    def __init__(self, root, remote, *, clock=time.monotonic, jitter=None):
         self.cache = SQLiteBackend(root, tracking=True)
         self.remote = remote
         self.url = remote.url
@@ -41,35 +43,63 @@ class OfflineBackend:
         self.configuration_error = getattr(remote, "configuration_error", "")
         self._sync_lock = threading.Lock()
         self._remote_lock = threading.RLock()  # snapshot fetch + installation stay ordered
-        self._event, self._stop = threading.Event(), threading.Event()
+        options = {'clock': clock, **({'jitter': jitter} if jitter is not None else {})}
+        self._schedule = SyncSchedule(**options)
+        self._notifications = ChangeNotifications(remote, self._notification, **options)
+        self._lifecycle = threading.Lock()
+        self._closed = False
+        self._cycle_changed = False
+        self._sync_enabled = False
+        self._blocked = False
         self._thread = None
         self._online, self._error, self._last_sync = False, "", 0
         self._import = None
         self._job = None
 
     def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self._run, name="textfold-storage-sync", daemon=True)
-        self._thread.start()
+        with self._lifecycle:
+            if self._closed or self._thread and self._thread.is_alive():
+                return
+            self._notifications.start()
+            self._thread = threading.Thread(target=self._run, name="textfold-storage-sync", daemon=True)
+            self._thread.start()
 
     def close(self):
-        self._stop.set()
-        self._event.set()
+        with self._lifecycle:
+            self._closed = True
+            self._schedule.close()
+        self._notifications.close()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(12)
 
     def _run(self):
-        while not self._stop.is_set():
-            self.sync()
-            self._event.wait(30)
-            self._event.clear()
+        while not self._closed:
+            generation = self._schedule.take()
+            if generation is None:
+                self._schedule.wait()
+                continue
+            state = self.sync()
+            self._schedule.finish(generation, error=bool(state['error']), blocked=self._blocked,
+                                  healthy=self._sync_enabled and self._notifications.status()['state'] == 'connected',
+                                  changed=self._cycle_changed, pending=bool(state['pending']))
 
-    def request_sync(self):
-        self._event.set()
+    def request_sync(self, reason='local'):
+        self._schedule.request(reason, healthy=self._notifications.status()['state'] == 'connected')
+
+    def _notification(self, reason, cursor):
+        if self._closed:
+            return
+        if reason == 'changed':
+            with self.cache.transaction() as db:
+                stored = db.execute("SELECT value FROM sync_state WHERE key='cursor'").fetchone()
+            if stored and cursor <= int(stored[0]):
+                return
+        self.request_sync(reason)
 
     def status(self):
         return {**self.cache.status(), "online": self._online, "syncing": self._sync_lock.locked(),
                 "error": self._error or self.configuration_error, "lastSync": self._last_sync,
-                "import": self._import, "job": self._job}
+                "import": self._import, "job": self._job, "notifications": self._notifications.status()}
 
     def background(self, action, source=None):
         if not self._sync_lock.acquire(blocking=False):
@@ -127,11 +157,15 @@ class OfflineBackend:
         with self.cache.transaction() as db:
             row = db.execute("SELECT value FROM sync_state WHERE key='library_id'").fetchone()
             if row and row[0] != health["library_id"]:
-                raise StorageError("Cloud library identity changed; keep this workspace and select a new cache folder")
+                raise StorageIdentityError("Cloud library identity changed; keep this workspace and select a new cache folder")
             cursor = db.execute("SELECT value FROM sync_state WHERE key='cursor'").fetchone()
             if cursor and int(cursor[0]) > health.get("cursor", 0):
-                raise StorageError("Cloud history moved backwards; keep this workspace and select a new cache folder for recovery")
+                raise StorageIdentityError("Cloud history moved backwards; keep this workspace and select a new cache folder for recovery")
             db.execute("INSERT OR IGNORE INTO sync_state VALUES ('library_id',?)", (health["library_id"],))
+            if health.get('sync_enabled') is not True:
+                db.execute("DELETE FROM sync_state WHERE key='v2_baseline'")
+        self._sync_enabled = health.get('sync_enabled') is True
+        self._notifications.configure(health)
         return health
 
     def _bytes(self, values):
@@ -285,48 +319,65 @@ class OfflineBackend:
         raise ConflictError("Cloud kept changing; local edits remain pending")
 
     def sync(self):
-        if not self._sync_lock.acquire(blocking=False):
+        if self._closed or not self._sync_lock.acquire(blocking=False):
             return self.status()
         self._remote_lock.acquire()
         try:
             health = self._health()
-            self._online, self._error = True, ""
+            self._online, self._error, self._blocked = True, "", False
             with self.cache.transaction() as db:
                 cursor = db.execute("SELECT value FROM sync_state WHERE key='cursor'").fetchone()
+                pending = [row[0] for row in db.execute("SELECT document_id FROM pending_changes UNION SELECT document_id FROM pending_requests")]
+                library_ready = db.execute("SELECT 1 FROM documents WHERE id=? AND loaded=1", (LIBRARY,)).fetchone()
+                baseline = db.execute("SELECT 1 FROM sync_state WHERE key='v2_baseline' AND value='complete'").fetchone()
+            # Legacy writes have no feed entries. A loaded library/cursor from
+            # an older build is not proof of a baseline after the v2 fence.
+            refresh_baseline = self._sync_enabled and not baseline
+            self._cycle_changed = bool(pending) or cursor is None or int(cursor[0]) != health['cursor']
+            if self._sync_enabled and baseline and cursor is not None and int(cursor[0]) == health['cursor'] and not pending and library_ready:
+                self._last_sync = time.time()
+                return self.status()
             if cursor is None:
                 self._index(self.remote.sync_index(), complete=True)
                 # Capture before indexing: commits racing with the initial scan
                 # will still be replayed from the change feed.
                 with self.cache.transaction() as db:
                     db.execute("INSERT INTO sync_state VALUES ('cursor',?)", (str(health["cursor"]),))
-            elif health.get("sync_enabled") is False:
+            elif health.get("sync_enabled") is False or refresh_baseline:
                 self._index(self.remote.sync_index(), complete=True)  # compatibility until the first v2 commit fences v1 writers
             self._pull()
-            with self.cache.transaction() as db:
-                pending = [row[0] for row in db.execute("SELECT document_id FROM pending_changes ORDER BY modified_at,document_id")]
             failures = []
             for identity in pending:
                 try:
                     self._push(identity)
                 except (OSError, ValueError, ConflictError) as error:
                     failures.append(str(error))
+                    self._blocked = self._blocked or isinstance(error, (StorageAuthenticationError, StorageIdentityError))
             with self.cache.transaction() as db:
                 dirty_library = db.execute("SELECT 1 FROM pending_changes WHERE document_id=?", (LIBRARY,)).fetchone()
-            if not dirty_library:
+            if not dirty_library and (not self._sync_enabled or not library_ready or refresh_baseline):
                 library = self._snapshot(LIBRARY)
                 with self.cache.transaction() as db:
                     old = db.execute("SELECT remote_revision FROM documents WHERE id=?", (LIBRARY,)).fetchone()
-                if not old or old[0] != library["revision"]:
+                if not library_ready or not old or old[0] != library["revision"]:
                     self._accept(LIBRARY, library)
+                if refresh_baseline:
+                    # Set only after index/feed and the post-fence library read
+                    # succeed. An interruption retries; no existing data resets.
+                    with self.cache.transaction() as db:
+                        db.execute("INSERT OR REPLACE INTO sync_state VALUES ('v2_baseline','complete')")
             if failures:
                 self._error = failures[0]
             else:
                 if health.get("sync_enabled") is False:
                     self._index(self.remote.sync_index(), complete=True)
-                self._pull()
+                if pending or not self._sync_enabled:
+                    self._pull()
                 self._last_sync = time.time()
         except (OSError, ValueError, ConflictError) as error:
             self._online, self._error = False, str(error)
+            self._blocked = isinstance(error, (StorageAuthenticationError, StorageIdentityError))
+            self._notifications.suspend()
         finally:
             self._remote_lock.release()
             self._sync_lock.release()
@@ -352,7 +403,12 @@ class OfflineBackend:
                 if identity == LIBRARY:
                     self._accept(identity, snapshot)
                 else:
-                    self._index([{"id": identity, "revision": snapshot["revision"], "info": snapshot["info"], "state": snapshot["state"]}])
+                    with self.cache.transaction() as db:
+                        loaded = db.execute("SELECT loaded FROM documents WHERE id=?", (identity,)).fetchone()
+                    if loaded and loaded[0]:
+                        self._accept(identity, snapshot)
+                    else:
+                        self._index([{"id": identity, "revision": snapshot["revision"], "info": snapshot["info"], "state": snapshot["state"]}])
             # An interrupted page can be replayed; never acknowledge unapplied
             # events before their local transactions have committed.
             with self.cache.transaction() as db:

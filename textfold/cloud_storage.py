@@ -25,6 +25,14 @@ class StorageError(OSError):
     """A transport, authentication or integrity failure; never an empty library."""
 
 
+class StorageAuthenticationError(StorageError):
+    """Credentials must be checked before retrying frequently."""
+
+
+class StorageIdentityError(StorageError):
+    """A workspace must never silently bind itself to a different library."""
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # urllib can forward Authorization headers when following redirects.
@@ -166,7 +174,7 @@ class CloudStorageBackend:
             if status == 409:
                 raise ConflictError("Remote document or library state changed; reload before saving") from None
             if status in (401, 403):
-                raise StorageError("Storage authentication failed") from None
+                raise StorageAuthenticationError("Storage authentication failed") from None
             raise StorageError(f"Storage request failed (HTTP {status}); reload before retrying a write") from None
         except (urllib.error.URLError, TimeoutError) as error:
             raise StorageError("Storage connection failed; a write may have committed, reload before retrying") from error
@@ -178,9 +186,33 @@ class CloudStorageBackend:
 
     def sync_health(self):
         value = self._request("GET", "health", version="v2")
-        if value.get("format") != "textfold/storage-v2" or not isinstance(value.get("library_id"), str):
+        if value.get("format") != "textfold/storage-v2" or not isinstance(value.get("library_id"), str) or not value["library_id"]:
             raise StorageError("This service needs the record synchronization upgrade")
+        if type(value.get("cursor")) is not int or not 0 <= value["cursor"] <= 9007199254740991:
+            raise StorageError("Invalid synchronization cursor")
         return value
+
+    def open_notifications(self, url, ping_interval=60):
+        import logging
+        from websockets.sync.client import connect
+        from websockets.exceptions import InvalidStatus
+        target, origin = urllib.parse.urlsplit(url), urllib.parse.urlsplit(self.url)
+        expected = 'wss' if origin.scheme == 'https' else 'ws'
+        if target.scheme != expected or target.netloc != origin.netloc or target.query or target.fragment or target.username or target.password:
+            raise ValueError('Notifications must use the configured storage origin')
+        # This pinned synchronous client rejects redirects. Disable its wire
+        # logger so even application-wide DEBUG cannot print Authorization.
+        logger = logging.Logger('textfold.storage.events')
+        logger.disabled = True
+        try:
+            return connect(url, additional_headers={'Authorization': self._authorization},
+                           user_agent_header=f'TextFold/{__version__}', proxy=None, compression=None,
+                           open_timeout=10, close_timeout=1, ping_interval=ping_interval, ping_timeout=20,
+                           max_size=4096, max_queue=8, logger=logger)
+        except InvalidStatus as error:
+            if error.response.status_code in (401, 403):
+                raise StorageAuthenticationError('Storage notification authentication failed') from None
+            raise StorageError('Storage notification upgrade failed') from None
 
     def sync_index(self):
         cursor, rows = "", []

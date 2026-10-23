@@ -12,7 +12,8 @@ cannot replace the previous revision. Listing reads only D1, never original PDFs
 
 ## Develop and test
 
-Use Node.js 22+ and the Python project dependencies, including `keyring`.
+Use Node.js 22+ and the Python project dependencies, including `keyring` and
+`websockets>=15,<16`.
 
 ```sh
 cd cloudflare/storage
@@ -24,6 +25,8 @@ Tests use workerd/Miniflare's actual local D1 and R2 implementations and run the
 shared Python backend contract over HTTP, plus application Settings/restart
 tests. Set `TEXTFOLD_TEST_PYTHON` if the Python environment is outside `.venv`.
 Test credentials and the explicit test keyring stay inside disposable fixtures.
+Notification tests also run real WebSocket subscriptions, explicit DO hibernation,
+cross-device Python reconciliation, missed-hint recovery and idle request counting.
 
 For interactive local development, create an ignored `.dev.vars` containing
 `STORAGE_USERNAME` and `STORAGE_PASSWORD`, then run:
@@ -70,6 +73,34 @@ After deployment, enter the HTTPS origin, username and password in TextFold
 Settings → Document storage. Test the connection, select Cloud storage, save and
 restart. Existing local documents are not uploaded or deleted. Use “Upload local
 library” explicitly; use “Download all for offline use” on other devices.
+
+## Change notifications
+
+The `NOTIFICATIONS` binding uses one `LibraryNotifications` Durable Object class
+and one instance per stable whole-library ID. The `notifications-v1` migration
+in `wrangler.jsonc` creates the SQLite-backed class during deployment; it does
+not migrate or remove D1/R2 document data. Preserve this migration entry in later
+releases. Existing deployment configurations need the binding, class export and
+migration to advertise the optional `/v2/events` capability.
+
+Only authenticated subscriptions reach the DO. After a D1 commit, a managed
+background RPC broadcasts a content-free cursor hint. HTTP writes remain
+successful if delivery fails. Hibernation uses platform-managed connections,
+not a resident subscription map or recurring DO timers. Clients send WebSocket
+protocol pings and perform a jittered five-minute health fallback; missed hints
+are repaired through the existing durable feed.
+
+To disable notifications temporarily, set Worker variable
+`NOTIFICATIONS_DISABLED` to the string `"true"`. Missing bindings also omit the
+capability. Clients then continue HTTP synchronization. Deploying only the new
+client against an old service is supported; enabling notifications requires
+deploying the updated Worker and restarting clients. No document migration or
+cache reset is required.
+
+Idle request-count tests use a virtual clock. Production Worker requests, DO
+requests and DO duration must be measured separately; there is no promised fixed
+billing reduction. See the [design](../../docs/storage-change-notifications-design.md)
+and [Cloudflare WebSocket hibernation guidance](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
 
 ## Operational limits
 

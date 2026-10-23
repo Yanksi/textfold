@@ -756,7 +756,8 @@ def make_handler(jobs):
                     try:
                         action = body.get("action", "sync")
                         if action == "sync":
-                            backend.request_sync()
+                            reason = body.get('reason', 'manual')
+                            backend.request_sync(reason if reason in ('manual', 'online', 'focus') else 'manual')
                         elif action in ("import", "download"):
                             from .storage_settings import active_path
                             backend.background(action, store.LocalDirectoryBackend(active_path(store.DATA, store.HOME)) if action == "import" else None)

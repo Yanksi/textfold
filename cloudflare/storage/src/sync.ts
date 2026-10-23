@@ -1,5 +1,6 @@
 import { Failure, object, identity, revision, reply, jsonBody, snapshot, loadSnapshot, validateDocument, documentInfo } from "./index";
 import type { StorageEnv, Json, ObjectValue } from "./index";
+import { NOTIFICATION_PROTOCOL, notificationsEnabled, publishChanges } from "./notifications";
 
 type Head = { id: string; revision: string; manifest_key: string; info_json: string; state: string; placement_json: string; created: number; updated: number };
 type Stored = { record_key: string; value_json: string | null; object_key: string | null; deleted: number };
@@ -185,12 +186,21 @@ async function current(env: StorageEnv, db: D1DatabaseSession, id: string): Prom
   return legacy ? { head: { ...legacy, state: "active", placement_json: "{}" }, values: await split(await loadSnapshot(env, legacy.manifest_key)) } : { head: null, values: {} };
 }
 
-export async function handleSync(request: Request, env: StorageEnv): Promise<Response> {
+export async function handleSync(request: Request, env: StorageEnv, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url), path = url.pathname, db = env.DB.withSession("first-primary");
   if (path === "/v2/health" && request.method === "GET") {
     const library = await db.prepare("SELECT library_id,sync_enabled FROM storage_identity WHERE singleton=1").first<{ library_id: string; sync_enabled: number }>();
     const cursor = await db.prepare("SELECT COALESCE(MAX(sequence),0) AS cursor FROM change_log").first<{ cursor: number }>();
-    return reply({ format: "textfold/storage-v2", library_id: library!.library_id, cursor: cursor!.cursor, sync_enabled: Boolean(library!.sync_enabled) });
+    return reply({ format: "textfold/storage-v2", library_id: library!.library_id, cursor: cursor!.cursor, sync_enabled: Boolean(library!.sync_enabled),
+      ...(notificationsEnabled(env) ? { notifications: { protocol: NOTIFICATION_PROTOCOL, path: "/v2/events" } } : {}) });
+  }
+  if (path === "/v2/events" && request.method === "GET") {
+    if (!notificationsEnabled(env)) throw new Failure(404, "Notifications unavailable");
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") throw new Failure(426, "WebSocket upgrade required");
+    const library = await db.prepare("SELECT library_id FROM storage_identity WHERE singleton=1").first<{ library_id: string }>();
+    return env.NOTIFICATIONS.getByName("library-notifications:" + library!.library_id).fetch(new Request("https://notifications.internal/", {
+      headers: { Upgrade: "websocket", "X-TextFold-Library": library!.library_id },
+    }));
   }
   if (path === "/v2/index" && request.method === "GET") {
     const rows = await db.prepare("SELECT id,revision,info_json,state FROM sync_documents WHERE id!=?1 AND id>?2 UNION ALL SELECT id,revision,info_json,'active' AS state FROM documents WHERE id>?2 AND id NOT IN (SELECT id FROM sync_documents) ORDER BY id LIMIT 100").bind(LIBRARY, url.searchParams.get("after") || "").all<{ id: string; revision: string; info_json: string; state: string }>();
@@ -300,5 +310,8 @@ export async function handleSync(request: Request, env: StorageEnv): Promise<Res
   statements.push(db.prepare(`UPDATE storage_identity SET sync_enabled=1 WHERE singleton=1 AND ${guard}`).bind(id, commit));
   const committed = await db.batch(statements);
   if (committed[0].meta.changes !== 1) throw new Failure(409, "Cloud document changed; reconcile and retry");
+  if (notificationsEnabled(env)) ctx.waitUntil(publishChanges(env).catch(() => {
+    console.error(JSON.stringify({ event: "storage_notification_delivery_failed" }));
+  }));
   return reply(result);
 }

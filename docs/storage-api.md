@@ -140,6 +140,61 @@ Documents; the generic storage adapter owns record reconciliation.
 | `GET /v2/library` | Same snapshot envelope for the reserved organization document |
 | `PUT /v2/library` | Same atomic commit for organization records |
 
+### Optional change notifications
+
+`GET /v2/health` may additionally return
+`"notifications": {"protocol": "textfold/changes-ws-v1", "path": "/v2/events"}`.
+Omitting this capability keeps HTTP polling available. The path is resolved
+relative to the configured origin with a trailing slash; a leading slash is
+origin-relative. An implementation behind a prefix can advertise
+`/prefix/v2/events`. Absolute URLs, queries, fragments and cross-origin targets
+are rejected. Endpoint settings still accept an origin, not an API base path.
+
+`GET` that path with `Upgrade: websocket` uses the same Basic Authorization
+header as the HTTP API. HTTPS uses WSS; WS is permitted only for an already
+validated loopback HTTP origin. Redirects are rejected; credentials never belong
+in URLs, query parameters or subprotocols. Missing support returns 404; a request
+without upgrade returns 426. Notification authentication and transport errors
+are reported separately from HTTP synchronization status.
+
+After authentication, the server registers the subscription **before** sending:
+
+```json
+{"type":"ready","protocol":"textfold/changes-ws-v1","library_id":"stable-library-id"}
+{"type":"changed","library_id":"stable-library-id","cursor":123}
+```
+
+Messages are UTF-8 JSON text, limited to 4 KiB. `cursor` must be a nonnegative
+JavaScript-safe integer. The stream is server-to-client only; clients use
+protocol ping/pong for liveness. No document content or credentials are sent.
+The server derives the library identity from authenticated context, not client
+headers. A library mismatch stops that subscription without rebinding the cache.
+
+Every `ready`, including reconnects, requests normal synchronization to cover
+the handshake window. A `changed` cursor is only a hint: it never advances the
+persisted cursor or acknowledges an outbox item. Duplicate, reordered and lost
+hints are harmless; the durable change feed remains authoritative. Broadcast
+only after a committed transaction, and keep a committed HTTP response
+successful if notification delivery fails.
+
+The client keeps one subscription per running workspace and serializes sync
+passes. With a healthy connection it checks health about every five minutes
+with jitter; an unchanged cursor skips change/snapshot reads only after initial
+indexing and the library baseline, with no pending or uncertain writes and
+`sync_enabled: true`. Old services and broken notification connections use
+backed-off HTTP polling. Local saves request sync immediately; network errors
+retain exponential backoff, while authentication errors use controlled retries.
+See the [notification design](storage-change-notifications-design.md).
+
+Legacy v1 writes have no change-feed entries. Before enabling the fast return,
+the client must persist proof that it refreshed both the index and library
+baseline **after** observing the v2 write fence. An already loaded library and
+matching cursor in an older cache are insufficient, including after restart.
+The local `sync_state.v2_baseline` marker is written only after those reads
+succeed; missing markers retry without clearing documents or outbox items.
+
+### Identity, commits and compatibility
+
 `library_id` is a persistent random identity. A client pins it in its workspace
 and refuses to submit old-library operations to a replacement service. The
 first version retains its complete change feed and tombstones; it never silently

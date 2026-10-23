@@ -1959,9 +1959,9 @@
     } catch { /* the local app may be restarting */ }
     finally { syncPolling = false; }
   }
-  const resumeStorage = () => { api('/api/storage/sync', { action: 'sync' }).catch(() => {}); pollStorage(); };
-  addEventListener('online', resumeStorage); addEventListener('focus', resumeStorage);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeStorage(); });
+  const resumeStorage = (reason) => { api('/api/storage/sync', { action: 'sync', reason }).catch(() => {}); pollStorage(); };
+  addEventListener('online', () => resumeStorage('online')); addEventListener('focus', () => resumeStorage('focus'));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeStorage('focus'); });
   setInterval(pollStorage, 10000); pollStorage();
 
   renderSidebar();

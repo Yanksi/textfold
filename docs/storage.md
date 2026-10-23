@@ -191,6 +191,15 @@ records, a fresh local revision, modification time and the outbox together.
 Cloud acknowledgements do not clear changes made while a request was in flight.
 Transport failures retry a durable operation ID and exactly the same payload.
 
+Cloud services may advertise optional authenticated WebSocket change hints.
+One Python connection per running workspace wakes the existing sync executor;
+notifications never acknowledge outbox items or move durable cursors. Healthy
+idle workspaces make a low-frequency health check and skip unchanged snapshots.
+Unsupported or failed notifications fall back to HTTP polling with backoff.
+Source immutability, offline saves and conflict handling remain the same. See
+the [protocol](storage-api.md#optional-change-notifications) and
+[design and validation boundaries](storage-change-notifications-design.md).
+
 The cloud is authoritative. Clean local copies can be discarded; pending edits,
 uncertain requests, conflicts and their blobs cannot. Cache bases are namespaced
 by endpoint/account and pin the remote library identity. A locked keyring still

@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import markdown, notes, picture, semantic, store
+from . import ids, markdown, notes, picture, semantic, store
 from .documents import Document, Source
 from .fetch import UA
 from .parse import parse
@@ -162,11 +162,13 @@ def _replace(pid, text, name, base):
     if not store.readable(pid):
         raise LookupError(pid)
     old = store.parsed(pid)
+    gone = ids.load(pid)
     with store.edit(pid) as document:
         was = document.meta
         title, html, meta = _read_md(text, name or (was.get("source") or {}).get("name") or "document.md")
         meta = {**was, **meta, "id": pid, "replaced": store.stamp()}
         html, images = _normalized(html, lambda folder: Images(folder, base).resolve, sizes=True)
+        html, new = ids.freeze(html, meta, old, gone)
         previous = Document(pid, meta=copy.deepcopy(was),
                             source=Source(html=document.source.html, markdown=document.source.markdown),
                             layers=copy.deepcopy(document.layers), notes=copy.deepcopy(document.notes),
@@ -174,18 +176,20 @@ def _replace(pid, text, name, base):
         document.previous = previous
         document.meta, document.source.html, document.source.markdown = meta, html, text
         document.images, document.layers = images, {}
-        new = parse(html, meta)
+    ids.remember(pid, old, new)
     notes.reanchor(pid, old, new)
     return title
 
 
-def store_doc(pid, html, meta, raw_kind, raw, resolver, sizes=False, replace=False):
+def store_doc(pid, html, meta, raw_kind, raw, resolver, sizes=False, replace=False, old=None):
     """Save a complete normalized document. Backends choose its representation."""
     if raw_kind not in ("markdown", "xml", "wiki_html"):
         raise ValueError("Unsupported source kind")
     if not replace and store.readable(pid):
         return pid
+    gone = ids.load(pid) if old is not None else None
     html, images = _normalized(html, resolver, sizes)
+    html, _ = ids.freeze(html, meta, old, gone)
     with store.edit(pid, create=True) as document:
         if not replace and document.meta is not None and document.source.html is not None:
             return pid

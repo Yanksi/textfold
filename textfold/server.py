@@ -63,6 +63,7 @@ rebinding) is the same origin as its requests to the browser, so only the name t
 keys live in ~/.textfold/settings.json (mode 600), never in the project folder, which may be synced or shared.
 """
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -82,7 +83,7 @@ from .documents import ConflictError
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from . import __version__, agents, bridges, build, engine, fetch, fold, langs, library, llm, local, models, notes, office, pdf, pdfdoc, pdffigs, pdftext, pipeline, providers, store, zotero
+from . import __version__, agents, bridges, build, engine, fetch, fold, ids, langs, library, llm, local, models, notes, office, pdf, pdfdoc, pdffigs, pdftext, pipeline, providers, store, zotero
 
 STATIC = {"app.js": "text/javascript", "app.css": "text/css", "reader.js": "text/javascript",
           "reader.css": "text/css", "i18n.js": "text/javascript", "tutorial.js": "text/javascript", "webmcp.js": "text/javascript"}
@@ -503,6 +504,9 @@ def assembled(pid, only=None):
     name = library.name_of(pid)
     if name:
         doc["meta"]["name"] = name
+    gone = ids.load(pid)   # (a link to a paragraph or section no longer in the text opens where it went)
+    if gone["units"] or gone["sections"]:
+        doc["gone"] = gone
     return doc
 
 
@@ -510,6 +514,7 @@ def reader_page(pid):
     repo = store.repository()
     sig = (repo.cache_token,) + repo.revision(pid)
     sig += ((build.WEB / "template.html").stat().st_mtime, library.name_of(pid))  # a changed page template, or name, re-renders too
+    sig += tuple((name, (build.WEB / name).stat().st_mtime_ns) for name in STATIC)
     hit = PAGES.get(pid)
     if not hit or hit[0] != sig:
         hit = (sig, build.page(assembled(pid), app=True))
@@ -545,7 +550,7 @@ def landing_page(jobs):
     boot = {"papers": papers, "folders": folders, "storageError": storage_error, "jobs": jobs.list(), "model": data["selectedName"] or "",
             "askName": data["askName"], "modelData": data,
             "bridge": data["bridge"], "langs": langs.natives()}
-    t = (build.WEB / "app.html").read_text(encoding="utf-8")
+    t = build.app_assets((build.WEB / "app.html").read_text(encoding="utf-8"))
     return t.replace("{{HEAD}}", build.fonts_head(build.APP_ASSETS)).replace("{{BOOT}}", json.dumps(boot, ensure_ascii=False).replace("</", "<\\/"))
 
 
@@ -629,7 +634,10 @@ def make_handler(jobs):
                     library.opened(m.group(1))
                     return self.send(200, reader_page(m.group(1)), "text/html; charset=utf-8")
                 if u.path.startswith("/static/") and u.path[8:] in STATIC:
-                    return self.send(200, (build.WEB / u.path[8:]).read_bytes(), STATIC[u.path[8:]] + "; charset=utf-8")
+                    data = (build.WEB / u.path[8:]).read_bytes()
+                    version = hashlib.sha256(data).hexdigest()
+                    cache = "private, max-age=31536000, immutable" if parse_qs(u.query).get("v") == [version] else "no-store"
+                    return self.send(200, data, STATIC[u.path[8:]] + "; charset=utf-8", cache=cache)
                 if u.path.startswith("/static/vendor/"):
                     f = vendor_file(unquote(u.path[len("/static/vendor/"):]))
                     if f:
@@ -692,6 +700,13 @@ def make_handler(jobs):
                     if lang not in langs.LANGS:
                         return self.json({"error": f"unknown language {lang}"}, 400)
                     return self.json(fold.document(pid, lang))
+                m = re.fullmatch(r"/api/ids/([\w.-]+)", u.path)   # what paragraphs' and sections' ids name now (ids.py)
+                if m:
+                    pid, q = m.group(1), parse_qs(u.query)
+                    if not (store.valid_id(pid) and store.readable(pid)):
+                        return self.json({"error": "no such paper"}, 404)
+                    asked = lambda k: [x for v in q.get(k, []) for x in v.split(",") if x][:1000]
+                    return self.json(ids.lookup(pid, store.parsed(pid), asked("u"), asked("s")))
                 m = re.fullmatch(r"/api/pdf/([\w.-]+)", u.path)
                 if m and store.valid_id(m.group(1)) and store.has(m.group(1)):
                     f = pdf.read(m.group(1)) if pdf.has_source(m.group(1)) else None

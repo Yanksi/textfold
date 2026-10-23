@@ -321,6 +321,7 @@ class CloudRoutes(unittest.TestCase):
         self.assertEqual(source.read_bytes(), original)
         _, remote = self.call('/api/import', {'name': 'remote.md', 'text': '# Remote\n\nSaved in D1 and R2.'})
         self.assertFalse((self.data / 'papers' / remote['paper']).exists())
+        self.assertEqual(self.call('/api/ids/' + remote['paper'] + '?u=historical')[0], 200)
         import time
         self.call('/api/storage/sync', {'action': 'sync'})
         for _ in range(100):

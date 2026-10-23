@@ -97,6 +97,25 @@ TEXT = "# Paper \U0001f4da\n\nFirst paragraph with \u4e2d\u6587 and a formula $x
 
 
 class BackendContract:
+    def test_stable_id_history_and_reader_cache_follow_document_revisions(self):
+        from textfold import ids, server
+        with store.use_backend(self.backend):
+            pid = local.import_text(TEXT)
+            current = store.parsed(pid)
+            old = copy.deepcopy(current)
+            lost = 'u-historical'
+            old['units'][lost] = copy.deepcopy(next(iter(old['units'].values())))
+            old['chunks'][0]['units'].append(lost)
+            original = copy.deepcopy(store.document(pid).source)
+            with mock.patch.object(store, 'pdir', side_effect=AssertionError('History metadata must use document storage')), \
+                 mock.patch.object(build, 'page', side_effect=lambda doc, **kw: json.dumps(doc.get('gone', {}))), \
+                 mock.patch.dict(server.PAGES, {}, clear=True):
+                self.assertEqual(json.loads(server.reader_page(pid)), {})
+                ids.remember(pid, old, current)
+                self.assertIn(lost, ids.load(pid)['units'])
+                self.assertIn(lost, json.loads(server.reader_page(pid))['units'])
+                self.assertEqual(store.document(pid).source, original)
+
     def test_a_real_pdf_is_parsed_through_a_disposable_workspace(self):
         from test_pdftext import typeset
         data = typeset([(20, "Storage Paper"), (11, "Embedded words are read without a model or remote filesystem.")])

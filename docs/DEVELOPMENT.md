@@ -3,6 +3,10 @@
 How the reader works, how to run and extend it. For what it is and how to use it, see the [README](../README.md).
 The notes format is [notes-format.md](notes-format.md).
 The document backend interface and the Settings library-location change are described in [storage.md](storage.md).
+The generic cloud storage protocol is in [storage-api.md](storage-api.md), with
+[D1/R2 deployment and integration tests](../cloudflare/storage/README.md).
+Reader save-queue regressions run with `node --test tests/reader-note-saves.test.cjs`;
+they execute the actual reader queue with disposable state and simulated HTTP failures.
 
 The same semantic zoom as ThoughtDAG's plaques, applied to a paper's HTML (LaTeXML) version:
 

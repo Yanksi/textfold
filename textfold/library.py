@@ -17,12 +17,15 @@ before this was kept is dated as well); when it was opened, each time the reader
      "added": {"2512.24601": 1791000000.0}, "opened": {"2512.24601": 1792000000.0}}
 """
 import json
+import copy
 import re
 import secrets
 import threading
 import time
 
 from . import store
+from .documents import ConflictError, LibraryState
+from . import sync_records
 
 _lock = threading.Lock()
 
@@ -36,11 +39,16 @@ def _times(d, key):
     return {p: float(t) for p, t in v.items() if store.valid_id(p) and isinstance(t, (int, float))}
 
 
+class _Catalog(dict):
+    pass  # merge base lives on the object, never in exported JSON
+
+
 def load():
     try:
-        d = store.repository().library().catalog
+        state = store.repository().library()
+        d = state.catalog
     except (OSError, ValueError):
-        d = {}
+        state, d = LibraryState(), {}
     folders = [{"id": f["id"], "name": f["name"], **({"parent": f["parent"]} if isinstance(f.get("parent"), str) else {})}
                for f in d.get("folders") or []
                if isinstance(f, dict) and isinstance(f.get("id"), str) and isinstance(f.get("name"), str)]
@@ -55,15 +63,32 @@ def load():
             f.pop("parent", None)
     of = d.get("of") if isinstance(d.get("of"), dict) else {}
     names = d.get("names") if isinstance(d.get("names"), dict) else {}
-    return {"folders": folders, "of": {p: f for p, f in of.items() if f in ids and store.valid_id(p)},
+    result = _Catalog({"folders": folders, "of": {p: f for p, f in of.items() if f in ids and store.valid_id(p)},
             "names": {p: n for p, n in names.items() if store.valid_id(p) and isinstance(n, str) and n.strip()},
-            "added": _times(d, "added"), "opened": _times(d, "opened")}
+            "added": _times(d, "added"), "opened": _times(d, "opened")})
+    result.state = copy.deepcopy(state)
+    return result
 
 
 def _save(d):
-    state = store.repository().library()
-    state.catalog = d
-    store.repository().save_library(state)
+    base = getattr(d, "state", None) or store.repository().library()
+    local = copy.deepcopy(base)
+    local.catalog.update(d)
+    commit(base, local)
+
+
+def commit(base, local):
+    """Keep a UI operation's actual base across concurrent sync/organization edits."""
+    for attempt in range(4):
+        current = store.repository().library()
+        merged, _ = sync_records.reconcile(sync_records.library_records(base), sync_records.library_records(local), sync_records.library_records(current))
+        state = sync_records.library_value(merged, current.revision)
+        try:
+            store.repository().save_library(state)
+            return state
+        except ConflictError:
+            if attempt == 3:
+                raise
 
 
 def folders():

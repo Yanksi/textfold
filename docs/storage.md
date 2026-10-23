@@ -5,6 +5,11 @@ primary index and the read/save unit. A plugin decides whether a document is a
 folder, a database record, an archive, or several objects in remote storage.
 Callers never supply storage keys, filenames, prefixes, or physical paths.
 
+The generic cloud client and its interoperable HTTP protocol are documented in
+[storage-api.md](storage-api.md). The first server implementation uses
+[Cloudflare D1/R2](../cloudflare/storage/README.md). Local folders remain the
+default, and selecting a cloud service never automatically migrates documents.
+
 ## Document values
 
 `textfold.documents.Document` contains the complete persisted document:
@@ -106,8 +111,8 @@ memory adapter storing complete Document objects, with no file/path methods.
 It tests originals, notes, layers, PDF parsing, generation, replacement, trash,
 stale-write rejection and interrupted parser processing.
 
-Automatic plugin discovery, remote authentication and selecting a remote backend
-in Settings remain future work.
+Automatic plugin discovery remains future work. Settings supports local storage
+and any HTTPS service implementing the versioned [Storage API](storage-api.md).
 
 ## Local compatibility
 
@@ -170,3 +175,56 @@ Symbolic links are refused during copying
 rather than followed outside the selected library. Errors appear in Settings,
 where a pending move can be cancelled. CLI reads use the active library; pending
 moves are activated by the next server start.
+
+## Cloud working copies and offline changes
+
+Settings → Document storage combines local and cloud selection. The cloud form
+contains service origin, username, password and an optional absolute cache base.
+Passwords use Python `keyring`; configuration stores only a credential reference.
+Selections take effect on server restart. Enabling cloud storage never uploads
+an existing local directory automatically.
+
+`OfflineBackend` exposes the same whole-document `StorageBackend` interface.
+It composes the generic HTTPS client with `SQLiteBackend`; application callers
+still do not read individual files or issue SQL. A SQLite transaction persists
+records, a fresh local revision, modification time and the outbox together.
+Cloud acknowledgements do not clear changes made while a request was in flight.
+Transport failures retry a durable operation ID and exactly the same payload.
+
+The cloud is authoritative. Clean local copies can be discarded; pending edits,
+uncertain requests, conflicts and their blobs cannot. Cache bases are namespaced
+by endpoint/account and pin the remote library identity. A locked keyring still
+allows previously cached reading/editing, while synchronization reports an error.
+Changing endpoint, account, mode or cache location is blocked until pending edits
+and unresolved conflicts have been handled. Recovery ZIP export is available;
+it does not mark changes synchronized or erase the old working copy.
+
+The default base is `<runtime>/cloud-cache/`; each namespace has `library.sqlite3`
+and `blobs/<sha256>`. This directory is separate from the legacy local library.
+The settings screen displays the exact active cache path.
+
+Manual actions: upload the active legacy library, download all active cloud
+originals for offline use, sync now, clear clean cache, export pending changes,
+and resolve retained revisions. Imports are resumable and repeatable, preserve
+the source directory and skip/report IDs whose originals differ. The first
+version imports active legacy documents; old local trash remains in the source.
+
+The local server exposes `GET /api/storage/sync`, `GET /api/storage/conflicts`,
+`GET /api/storage/export` and `POST /api/storage/sync` with actions `sync`,
+`import`, `download`, `clear`, `resolve`. Conflict resolution takes `document`,
+`conflict`, `choice` (0/1; or restore/delete for document state), and optional
+manual annotation `text`. A successful note save reports local/cloud state in
+`X-TextFold-Save-State` and `X-TextFold-Online`; the UI keeps a pending indicator.
+
+Resolving an old conflict retains subsequent edits of its ambiguous fields as a
+new conflict against the selected result. Delete/edit conflicts are recoverable
+in either synchronization order. Failed browser writes retain their unconfirmed
+field changes for retry, and background refresh does not replace those drafts.
+
+Cloud target changes retain the active workspace selection and its keyring
+reference until startup checks it again. Pending edits, uncertain requests or
+unresolved conflicts cancel the switch and keep the previous workspace active;
+the Settings error explains why. No document data is moved or removed.
+
+See the [approved design](storage-offline-sync-design.md) for merging and
+retention rules. SQL schemas are internal adapter details, not plugin interfaces.

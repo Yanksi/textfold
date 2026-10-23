@@ -154,7 +154,9 @@ def repository():
         # Embedders and existing tests that explicitly replace DATA get an
         # isolated library, never a persisted selection from the user's home.
         root = active_path(DATA, HOME) if Path(DATA) == Path(_DEFAULT_DATA) else DATA
-        _repository = DocumentStore(LocalDirectoryBackend(root))
+        from .cloud_settings import configured
+        cloud = configured(HOME, DATA) if Path(DATA) == Path(_DEFAULT_DATA) else None
+        _repository = DocumentStore(cloud or LocalDirectoryBackend(root))
         _repository_default = default
     return _repository
 
@@ -233,7 +235,8 @@ def storage_status():
     from . import storage_settings
     backend = repository().backend
     if not isinstance(backend, LocalDirectoryBackend):
-        return {"backend": getattr(backend, "name", "custom"), "path": "", "pending": "", "error": ""}
+        local = storage_settings.status(storage_settings.active_path(DATA, HOME), HOME)
+        return {"backend": getattr(backend, "name", "custom"), "path": "", "pending": "", "error": "", "local": local}
     return storage_settings.status(backend.root, HOME)
 
 
@@ -241,7 +244,11 @@ def schedule_storage(path=None, cancel=False):
     from . import storage_settings
     backend = repository().backend
     if not isinstance(backend, LocalDirectoryBackend):
-        raise ValueError("The selected backend does not expose a local folder setting")
+        from .offline_storage import OfflineBackend
+        if not isinstance(backend, OfflineBackend):
+            raise ValueError("The selected backend does not expose a local folder setting")
+        storage_settings.schedule(storage_settings.active_path(DATA, HOME), HOME, path, cancel)
+        return storage_status()
     return storage_settings.schedule(backend.root, HOME, path, cancel)
 
 
@@ -250,9 +257,12 @@ def initialize_storage():
     global _repository, _repository_default
     if _repository is not None and _repository_default is None:
         return   # an embedding explicitly installed a backend
+    from .cloud_settings import configured
+    cloud = configured(HOME, DATA) if Path(DATA) == Path(_DEFAULT_DATA) else None
     from . import storage_settings
-    root = storage_settings.activate(DATA, HOME)
-    _repository = DocumentStore(LocalDirectoryBackend(root))
+    # Cloud selection must not activate a scheduled local-folder migration.
+    root = None if cloud else storage_settings.activate(DATA, HOME)
+    _repository = DocumentStore(cloud or LocalDirectoryBackend(root))
     _repository_default = (Path(DATA), Path(HOME))
 
 
@@ -374,7 +384,7 @@ def papers(index=None):
         meta = info.meta
         out.append({"id": info.id, "title": meta["title"], "titles": info.titles,
                     "authors": meta.get("authors", []), "langs": info.languages,
-                    "updated": info.updated, "notes": info.note_count,
+                    "updated": info.updated, "notes": info.note_count, "readable": info.readable,
                     **({"zotero": True} if meta.get("zotero") else {})})
     return sorted(out, key=lambda p: -p["updated"])
 

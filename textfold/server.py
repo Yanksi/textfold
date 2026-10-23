@@ -78,6 +78,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from .documents import ConflictError
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -134,6 +135,11 @@ def refresh_models():
     threading.Thread(target=refresh, daemon=True).start()
 
 
+def cloud_storage_status():
+    from . import cloud_settings
+    return cloud_settings.status(store.HOME, store.repository().backend)
+
+
 def models_payload():
     s = models.load_settings()
     with DISCOVERY_LOCK:
@@ -164,6 +170,7 @@ def models_payload():
         "presets": providers.PRESETS[:-1] + [models.ANTHROPIC_PRESET, providers.PRESETS[-1]],
         "useThoughtdagEnv": s.get("use_thoughtdag_env", True), "thoughtdagEnv": providers.THOUGHTDAG_ENV.exists(),
         "pdfTier": s.get("pdf_tier") or "fast", "engine": engine.status(), "storage": store.storage_status(),
+        "cloudStorage": cloud_storage_status(),
         "lang": s.get("lang") if s.get("lang") in langs.LANGS else None,
     }
 
@@ -527,7 +534,15 @@ def landing_page(jobs):
     # long for them, so it names the model in use rather than asking for one to be connected
     agents.wait_scanned(2)
     data = models_payload()
-    boot = {"papers": listed(), "folders": library.folders(), "jobs": jobs.list(), "model": data["selectedName"] or "",
+    from .cloud_storage import StorageError
+    storage_error = ""
+    try:
+        papers, folders = listed(), library.folders()
+    except StorageError as error:
+        # The settings page must remain usable when a cloud service/keyring is
+        # unavailable. This is an explicit error state, never a local fallback.
+        papers, folders, storage_error = [], {"folders": []}, str(error)
+    boot = {"papers": papers, "folders": folders, "storageError": storage_error, "jobs": jobs.list(), "model": data["selectedName"] or "",
             "askName": data["askName"], "modelData": data,
             "bridge": data["bridge"], "langs": langs.natives()}
     t = (build.WEB / "app.html").read_text(encoding="utf-8")
@@ -552,6 +567,13 @@ def make_handler(jobs):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", cache)
+            if 200 <= code < 300 and self.command == "POST" and (self.path.startswith("/api/notes/") or self.path == "/api/ask"):
+                from .offline_storage import OfflineBackend
+                backend = store.repository().backend
+                if isinstance(backend, OfflineBackend):
+                    status = backend.status()
+                    self.send_header("X-TextFold-Save-State", "local" if status["pending"] else "synced")
+                    self.send_header("X-TextFold-Online", "1" if status["online"] else "0")
             self.end_headers()
             try:
                 self.wfile.write(data)
@@ -618,6 +640,18 @@ def make_handler(jobs):
                     return self.json(library.folders())
                 if u.path == "/api/storage":
                     return self.json(store.storage_status())
+                if u.path == "/api/storage/cloud":
+                    return self.json(cloud_storage_status())
+                if u.path in ("/api/storage/sync", "/api/storage/conflicts", "/api/storage/export"):
+                    from .offline_storage import OfflineBackend
+                    backend = store.repository().backend
+                    if not isinstance(backend, OfflineBackend):
+                        return self.json(notes.conflicts() if u.path.endswith("/conflicts") else None)
+                    if u.path.endswith("/conflicts"):
+                        return self.json(backend.conflicts())
+                    if u.path.endswith("/export"):
+                        return self.send(200, backend.export_pending(), "application/zip")
+                    return self.json(backend.status())
                 if u.path == "/api/langs":
                     return self.json([{"code": code, "name": name} for code, name in langs.natives().items()])
                 if u.path == "/api/jobs":
@@ -649,7 +683,7 @@ def make_handler(jobs):
                         return self.json({"error": str(e)}, 400)
                 m = re.fullmatch(r"/api/notes/([\w.-]+)", u.path)
                 if m and store.valid_id(m.group(1)) and store.has(m.group(1)):
-                    return self.json(notes.read(m.group(1)))
+                    return self.json(notes.present(notes.read(m.group(1))))
                 m = re.fullmatch(r"/api/doc/([\w.-]+)", u.path)   # (a document not folded yet: its local levels, said so)
                 if m:
                     pid, lang = m.group(1), (parse_qs(u.query).get("lang") or ["en"])[0]
@@ -693,6 +727,42 @@ def make_handler(jobs):
                 if size > 12_000_000:   # a Markdown file is far smaller; this is a request gone wrong
                     return self.json({"error": "too-large"}, 413)
                 body = json.loads(self.rfile.read(size) or b"{}")
+                if u.path == "/api/storage/sync":
+                    from .offline_storage import OfflineBackend
+                    backend = store.repository().backend
+                    if not isinstance(backend, OfflineBackend):
+                        if body.get("action") == "resolve" and store.valid_id(body.get("document", "")):
+                            try:
+                                notes.resolve(body["document"], str(body.get("conflict", "")), body.get("choice"), body.get("text"))
+                                return self.json(None)
+                            except (ValueError, OSError, ConflictError) as error:
+                                return self.json({"error": str(error)}, 400)
+                        return self.json({"error": "Select cloud storage and restart first"}, 400)
+                    try:
+                        action = body.get("action", "sync")
+                        if action == "sync":
+                            backend.request_sync()
+                        elif action in ("import", "download"):
+                            from .storage_settings import active_path
+                            backend.background(action, store.LocalDirectoryBackend(active_path(store.DATA, store.HOME)) if action == "import" else None)
+                        elif action == "clear":
+                            return self.json(backend.clear_cache())
+                        elif action == "resolve":
+                            backend.resolve(str(body.get("document", "")), str(body.get("conflict", "")), body.get("choice"), body.get("text"))
+                        else:
+                            raise ValueError("Unknown storage action")
+                        return self.json(backend.status())
+                    except (ValueError, OSError, ConflictError) as error:
+                        return self.json({"error": str(error)}, 400)
+                if u.path in ("/api/storage/cloud", "/api/storage/cloud/test"):
+                    from . import cloud_settings
+                    try:
+                        if not isinstance(body, dict):
+                            raise ValueError("Expected cloud storage settings")
+                        result = cloud_settings.test(store.HOME, body) if u.path.endswith("/test") else cloud_settings.save(store.HOME, body, store.repository().backend)
+                        return self.json(result)
+                    except (ValueError, OSError) as error:
+                        return self.json({"error": str(error)}, 400)
                 if u.path == "/api/storage":
                     try:
                         return self.json(store.schedule_storage(body.get("path"), bool(body.get("cancel"))))
@@ -761,18 +831,8 @@ def make_handler(jobs):
                     text, name = str(body.get("text") or ""), str(body.get("name") or "document.md")[:200]
                     if not text.strip():
                         return self.json({"error": "empty"}, 400)
-                    if body.get("id"):   # an edited text in place of the one stored (a note folded again where it is written)
-                        pid = str(body["id"])
-                        if any(j["pid"] == pid and j["status"] in ("queued", "running") for j in jobs.list()):
-                            return self.json({"error": "busy"}, 409)
-                        try:
-                            title = local.replace_text(pid, text, name if body.get("name") else None)
-                        except LookupError:
-                            return self.json({"error": "no such document"}, 404)
-                        except ValueError:
-                            return self.json({"error": "not-markdown"}, 400)
-                        PAGES.pop(pid, None)
-                        return self.json({"paper": pid, "title": title, "replaced": True})
+                    if body.get("id"):
+                        return self.json({"error": "Original source is immutable; import changed content as a new document"}, 409)
                     try:
                         pid = local.import_text(text, name)
                     except ValueError:
@@ -817,8 +877,8 @@ def make_handler(jobs):
                 if m and store.valid_id(m.group(1)) and store.has(m.group(1)):
                     try:
                         if body.get("op") == "delete":
-                            return self.json(notes.delete(m.group(1), str(body.get("id", ""))))
-                        return self.json(notes.put(m.group(1), body.get("note")))
+                            return self.json(notes.present(notes.delete(m.group(1), str(body.get("id", "")), body.get("base"))))
+                        return self.json(notes.present(notes.put(m.group(1), body.get("note"))))
                     except ValueError as e:
                         return self.json({"error": str(e)}, 400)
                 if u.path == "/api/bridge/start":
@@ -867,6 +927,9 @@ def make_handler(jobs):
                         return self.json({"error": str(e)}, 400)
                 if u.path == "/api/ask/stop":
                     notes.stop(str(body.get("req") or "")[:40])
+                    if store.valid_id(body.get("paper", "")) and body.get("id"):
+                        notes.cancel_question(body["paper"], body["id"], str(body.get("req") or "")[:40])
+                        return self.json(notes.present(notes.read(body["paper"])))
                     return self.json({"ok": True})
                 if u.path == "/api/ask":
                     pid = str(body.get("paper", ""))
@@ -875,7 +938,7 @@ def make_handler(jobs):
                     try:
                         return self.json(notes.ask(pid, str(body.get("id", "")), str(body.get("question", "")).strip()[:2000],
                                                    models.ask_spec(), ui=str(body.get("ui") or ""),
-                                                   req=str(body.get("req") or "")[:40] or None))
+                                                   req=str(body.get("req") or "")[:40] or None, parent=body.get("parent")))
                     except notes.Stopped:
                         return self.json({"error": "stopped"}, 409)
                     except ValueError as e:
@@ -1012,6 +1075,10 @@ def serve(port=3017):
     if os.name == "nt":
         _quiet_children()
     store.initialize_storage()
+    from .offline_storage import OfflineBackend
+    backend = store.repository().backend
+    if isinstance(backend, OfflineBackend):
+        backend.start()
     jobs = Jobs()
     # look for the agents on this computer while the server comes up, and erase what was deleted 30 days ago
     threading.Thread(target=agents.scan, kwargs={"log": print}, daemon=True).start()
@@ -1034,4 +1101,6 @@ def serve(port=3017):
     except KeyboardInterrupt:
         pass
     finally:
+        if isinstance(backend, OfflineBackend):
+            backend.close()
         withdraw(f)

@@ -18,6 +18,7 @@ elsewhere, its address and its data folder ("base", "data_dir"), which only that
 server at another address, or at another folder to read files from.
 """
 import json
+import copy
 import re
 import threading
 import urllib.error
@@ -277,14 +278,15 @@ def citekeys():
 
 def link(lib, key, pid, title, record=None):
     with _lock:
+        from . import library
         try:
-            data = store.repository().library().zotero
+            base = store.repository().library()
         except (OSError, ValueError):
-            data = {}
-        data[f"{lib}/{key}"] = {"paper": pid, "title": title, **({"record": record} if record else {})}
-        state = store.repository().library()
-        state.zotero = data
-        store.repository().save_library(state)
+            from .documents import LibraryState
+            base = LibraryState()
+        state = copy.deepcopy(base)
+        state.zotero[f"{lib}/{key}"] = {"paper": pid, "title": title, **({"record": record} if record else {})}
+        library.commit(base, state)
 
 
 def apply(pid):

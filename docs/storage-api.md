@@ -1,0 +1,225 @@
+# TextFold Storage API
+
+This is the wire protocol used by the generic Python `CloudStorageBackend`.
+The application-facing plugin interface remains whole-document
+[`StorageBackend`](storage.md). Clients do not inspect a server's physical file
+layout. The [D1/R2 Worker](../cloudflare/storage/) is one implementation.
+
+## Authentication and errors
+
+Settings takes an HTTPS **origin** (for example `https://storage.example.com`),
+username and password. Requests use HTTP Basic authentication with the UTF-8
+bytes of `username:password`; usernames cannot contain `:`. All routes require
+authentication, including health and binary objects. HTTP is allowed only on
+loopback during development. Redirects are rejected to avoid forwarding secrets.
+
+Errors are JSON `{ "error": "safe explanation" }`. Use 400 for invalid input,
+401/403 for failed authentication, 404 for a missing document/object, 409 for a
+stale revision or incomplete upload, 413 for size limits and 503 for unavailable
+storage. Never return credentials or raw exception/request dumps. JSON responses
+are objects and use `Cache-Control: no-store`.
+
+## Routes
+
+All paths start with `/v1`. IDs are URL-encoded path segments. A successful
+mutation returns HTTP 200. `commit` and non-null `revision` are opaque UUID
+strings. A `revision: null` save is create-only; other saves must compare the
+supplied revision atomically with the current revision and return 409 on conflict.
+
+| Method and path | Request | Successful response |
+| --- | --- | --- |
+| `GET /health` | — | `{ "format": "textfold/storage-v1" }` |
+| `GET /documents?after=<id>` | — | `{ "documents": [DocumentInfo], "next": "last-id-or-null" }` |
+| `GET /documents/<id>/info` | — | `DocumentInfo` |
+| `GET /documents/<id>` | — | `{ "document": DocumentManifest, "info": DocumentInfo }` |
+| `PUT /documents/<id>` | `{ "revision": "old-or-null", "commit": "new-uuid", "document": DocumentManifest }` | New `DocumentInfo` |
+| `DELETE /documents/<id>` | — | `{ "deleted": "id" }` |
+| `POST /documents/<id>/trash` | `{ "commit": "new-uuid", "placement": {} }` | `{ "token": "uuid" }` |
+| `POST /documents/<id>/restore` | `{}` | `{ "placement": {} }`, or null placement if absent/already active |
+| `POST /trash/purge` | `{ "before": 1234567890.5 }` | `{ "removed": ["trash-token"] }` |
+| `GET /library` | — | `{ "catalog": {}, "zotero": {}, "revision": "uuid-or-null" }` |
+| `PUT /library` | `{ "catalog": {}, "zotero": {}, "revision": "old-or-null", "commit": "new-uuid" }` | `{ "revision": "new-uuid" }` |
+| `HEAD /blobs/<sha256>` | — | 200 if uploaded/registered, otherwise 404 |
+| `PUT /blobs/<sha256>` | Raw bytes, `Content-Length` required | `{ "sha256": "hex", "size": 123 }` |
+| `GET /blobs/<sha256>` | — | Raw bytes, `application/octet-stream` |
+
+Listing is ordered by document ID with an exclusive `after` cursor; `next` is
+null at the end. It must not load binary originals or manifests. Documents with
+`meta: null` represent pending source references: `get` works, but listing omits
+them and `info` returns 404. The client updates the passed document/state token
+only after a successful save. Restore refreshes the revision, avoiding reuse of
+an obsolete save token. Restore chooses the newest trash entry and never
+overwrites an active document. Purge uses a strict `deleted_at < before` cutoff.
+
+## Document manifests
+
+The JSON manifest is a complete semantic document snapshot. A `BlobRef` is
+`{ "sha256": "64-lowercase-hex-characters", "size": 123 }`; maps below use logical
+resource identifiers, not physical object paths. Binary slots are explicit, so
+ordinary user JSON cannot be confused with encoded bytes.
+
+```json
+{
+  "format": "textfold/document-v1",
+  "id": "md-example",
+  "meta": { "id": "md-example", "title": "Example" },
+  "source": {
+    "html": "<article>Example</article>", "markdown": "# Example",
+    "xml": null, "wiki_html": null, "reference": null,
+    "pdf": null, "originals": {}
+  },
+  "layers": {}, "notes": null, "images": {},
+  "processing": { "layout": null, "structured": null, "replies": {} },
+  "previous": null, "extensions": {}, "legacy": {},
+  "created": 0, "updated": 0
+}
+```
+
+`source.pdf` is null or a BlobRef. `source.originals`, `images`,
+`processing.replies`, `extensions` and `legacy` map identifiers to BlobRefs.
+`previous` is null or another manifest for the same ID, up to eight levels deep.
+All fields above are required. `layers` maps layer names (`en`, `tr-zh`, etc.) to
+JSON objects. Notes and processing values retain their application's JSON schema.
+`legacy` is opaque byte-preservation data for lossless local-library round trips;
+servers preserve it without interpreting it.
+
+Upload and verify all referenced blobs before publishing a manifest. Existing
+content addressed by a SHA-256 hash is immutable. The server must prevent
+publication with missing blobs, publish index and revision atomically, and leave
+the old document readable on failure. SHA-256 and sizes are checked on download.
+The physical storage arrangement is entirely the server's choice.
+
+`DocumentInfo` has `id`, `meta`, `titles` (translation language → title),
+`languages` (`en` first if present, then sorted translation languages),
+`note_count`, `created`, `updated`, `revision`, `readable`. Times are Unix seconds.
+`readable` is true when metadata and HTML source exist. On read, root timestamps
+and revision come from `info`, not the immutable manifest's original timestamps.
+
+## Desktop settings and credentials
+
+Settings → Cloud storage configures, tests and selects an endpoint. Selection
+takes effect on server restart. It does not migrate any local or remote data.
+Returning to local restores the previously selected local library location.
+
+`~/.textfold/cloud-storage.json` contains selection, URL, username and an opaque
+credential reference. Passwords use Python `keyring`, under service
+`TextFold cloud storage v1`. Credentials are outside document storage and local
+library migration. No password is returned by Settings APIs. A blank password
+can reuse the saved password only for the same URL and username. Keyring errors
+are explicit; no plaintext fallback is provided. On a locked/unavailable keyring,
+the library remains unavailable and Settings can reconnect or switch to local.
+
+`GET /api/storage/cloud` returns redacted settings including `enabled`, `active`,
+`url`, `username`, `hasPassword`, `restartRequired`, `error`.
+`POST /api/storage/cloud` takes `{enabled, url, username, password}`; enabling
+requires a successful health check before credentials/selection are saved.
+`{enabled: false}` selects local for the next restart. Credentials stay available
+for a later reconnection. `POST /api/storage/cloud/test` tests the supplied
+connection without saving it. The local server's existing host/origin protections
+apply to all these routes.
+
+Python keyring chooses the system backend. On Linux, install/unlock an available
+Secret Service/KWallet backend as appropriate. See the
+[keyring documentation](https://keyring.readthedocs.io/en/latest/).
+
+## Record synchronization v2
+
+New cloud clients require both the v1 blob transport and the v2 routes below.
+Authentication, origin restrictions, errors and limits remain the same. This
+protocol is independent of D1/R2: an alternative server can use any transactional
+index and immutable blob store. The application-facing interface remains whole
+Documents; the generic storage adapter owns record reconciliation.
+
+| Method and path | Response / purpose |
+| --- | --- |
+| `GET /v2/health` | `{format: "textfold/storage-v2", library_id, cursor, sync_enabled}` |
+| `GET /v2/index?after=<id>` | `{documents: [{id, revision, info, state}], next}`; includes trash/deleted metadata |
+| `GET /v2/changes?cursor=<integer>` | `{changes: [{sequence, document_id, revision, state}], cursor, more}` |
+| `GET /v2/documents/<id>` | `{records, revision, state, placement, info}` |
+| `PUT /v2/documents/<id>` | Apply one atomic sparse record commit; return `{revision, state, info}` |
+| `GET /v2/library` | Same snapshot envelope for the reserved organization document |
+| `PUT /v2/library` | Same atomic commit for organization records |
+
+`library_id` is a persistent random identity. A client pins it in its workspace
+and refuses to submit old-library operations to a replacement service. The
+first version retains its complete change feed and tombstones; it never silently
+expires a cursor. Clients must commit a pulled page locally before advancing
+its cursor. Initial indexing records the health cursor **before** scanning and
+then replays changes from that position, including changes racing with the scan.
+Unknown originals stay lazy until opened or downloaded explicitly.
+
+`@library` is reserved and may appear as a `document_id` in the change feed;
+it is addressed only through `/v2/library`. Every record key is scoped to its
+document. State is `active`, `trash`, or `deleted`; deletion retains the ID and
+its last records so stale create requests cannot resurrect it. Explicit restore
+is a new CAS commit setting state to active.
+
+A commit body is:
+
+```json
+{
+  "operation_id": "a fresh UUID, stable across retries",
+  "revision": "the last cloud revision, or null for creation",
+  "changes": [
+    {"key": "annotation/n-example", "deleted": false,
+     "value": {"id": "n-example", "anchor": {"unit": "p1"}, "text": "My note"}},
+    {"key": "alias/n-duplicate", "deleted": false, "value": "n-example"}
+  ],
+  "state": "active",
+  "placement": {},
+  "created": 1792700000
+}
+```
+
+`revision: null` is create-only. A revision mismatch returns 409 and writes
+nothing. The operation ID identifies the complete request **and target document**;
+a byte-equivalent semantic replay returns its original acknowledgement, while
+reusing an ID with different content or target returns 409. Clients persist the
+request before sending, retry uncertain requests first, and generate a new ID
+only when deliberately rebasing against a newer cloud revision. JSON key order
+does not change request identity.
+
+The server validates all changes, immutable source and message ancestry, writes
+immutable object data, then atomically commits records, tombstones, document
+index, operation acknowledgement and change log. Orphan immutable uploads are
+safe to retain after failure. No acknowledgement is returned before SQL commits.
+A failed CAS must not publish even an unchanged legacy record.
+
+Record families map the document-v1 manifest without exposing physical paths:
+
+- `meta`, `previous`, `notes` hold document metadata, prior export content and
+  notes header respectively.
+- `source/<field>`, `source.originals/<format>`, `processing/<field>`,
+  `processing.replies/<id>`, `layers/<language>`, `images/<id>`,
+  `extensions/<id>`, `legacy/<id>` retain the corresponding manifest values.
+- `annotation/<id>` stores note/highlight fields without embedded conversations.
+- `message/<annotation-id>/<message-id>` stores `{id, parent, role, text, ...}`.
+  Parent IDs are within that annotation. All branches must be acyclic with
+  existing parents. Confirmed messages are immutable; pending generation nodes
+  can complete without changing identity, parent or role. Deleting a whole
+  conversation can tombstone its messages.
+- `conflict/<id>` retains `key`, `base`, two `variants`, deletion intent and
+  ambiguous fields. Restoring a deleted conversation preserves its ancestry.
+- `alias/<old-id>` keeps links to deduplicated equivalent highlights valid.
+- Organization uses `catalog.folders/<id>`, `catalog.<map>/<id>`,
+  `catalog/<field>` and `zotero/<id>`; `catalog/folder_order` and
+  `zotero-order` retain their existing display order; conflicts use the same conflict family.
+
+Blob references still use `{sha256, size}` and `/v1/blobs/<sha256>`; upload and
+verify missing blobs before committing records that reference them. Large record
+bodies may be stored privately outside SQL, but snapshots must return complete
+record values. This implementation moves values above 128 KiB to immutable R2
+objects and retains full recovery manifests as well as individual SQL records.
+
+Clients reconcile base/local/remote records before CAS. Independent records and
+annotation fields merge; same-field ambiguity retains revisions rather than
+using device clocks. Completed AI branches union by message ID and parent.
+Delete-versus-edit keeps deletion visible and retains the edited revision for
+explicit recovery. Model calls are not sync operations and must never replay as
+a consequence of reconnection.
+
+The first v2 commit upgrades the library to record-aware writes. Existing v1
+snapshots remain readable and are imported on their first v2 mutation. All
+subsequent legacy document/library/trash mutations return 409; v1 immutable blob
+transport remains available. Deploy all migrations before deploying the Worker.
+Upgrading the schema does not delete any v1 manifest, original or local document.

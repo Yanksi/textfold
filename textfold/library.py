@@ -38,7 +38,7 @@ def _times(d, key):
 
 def load():
     try:
-        d = json.loads(store.read_text(path()))
+        d = store.repository().library().catalog
     except (OSError, ValueError):
         d = {}
     folders = [{"id": f["id"], "name": f["name"], **({"parent": f["parent"]} if isinstance(f.get("parent"), str) else {})}
@@ -61,11 +61,9 @@ def load():
 
 
 def _save(d):
-    f = path()
-    f.parent.mkdir(parents=True, exist_ok=True)
-    tmp = f.with_name(f.name + ".tmp")
-    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(f)
+    state = store.repository().library()
+    state.catalog = d
+    store.repository().save_library(state)
 
 
 def folders():
@@ -176,20 +174,14 @@ def _papers(pids):
     return pids
 
 
-def _came_in(pid):
-    """When a document came in, from its folder: its oldest file, or the folder itself when that is older."""
-    d = store.pdir(pid)
-    st = d.stat()
-    times = [f.stat().st_mtime for f in d.rglob("*") if f.is_file()]
-    return min(times + [getattr(st, "st_birthtime", st.st_mtime)])
-
-
-def stamp(papers):
+def stamp(papers, index=None):
     """The documents of the list (store.papers), each with when it came in ("added") and when it was last opened
     ("opened", or None), and the name the reader gave it, if any; one listed for the first time is dated here and kept."""
     with _lock:
         d = load()
-        new = {p["id"]: _came_in(p["id"]) for p in papers if p["id"] not in d["added"]}
+        missing = [p["id"] for p in papers if p["id"] not in d["added"]]
+        created = {row.id: row.created for row in (store.repository().list() if index is None else index)} if missing else {}
+        new = {pid: created.get(pid, time.time()) for pid in missing}
         if new:
             d["added"].update(new)
             _save(d)

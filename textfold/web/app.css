@@ -392,6 +392,11 @@ dialog.settings::backdrop { background: rgba(30, 25, 15, .28); }
 .st-form { display: grid; gap: 10px; margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .st-form > label { display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); }
 .st-form input, .st-form select { background-color: var(--surface) !important; }
+.st-storage-current { display: grid; gap: 6px; margin: 8px 0; }
+.st-storage-current code, .st-storage .st-note code { overflow-wrap: anywhere; font-size: 12px; }
+.st-storage-path { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.st-storage-path input { flex: 1; min-width: 0; width: 100%; }
+.st-storage-path button { flex-shrink: 0; }
 .pf-err { font-size: 12.5px; color: var(--r-limitation); }
 .st-pick { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 12px; max-height: 220px; overflow-y: auto; font-size: 13px; }
 .st-pick .st-label { grid-column: 1 / -1; font-size: 12.5px; color: var(--muted); margin-bottom: 2px; }

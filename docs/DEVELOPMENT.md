@@ -2,6 +2,7 @@
 
 How the reader works, how to run and extend it. For what it is and how to use it, see the [README](../README.md).
 The notes format is [notes-format.md](notes-format.md).
+The document backend interface and the Settings library-location change are described in [storage.md](storage.md).
 
 The same semantic zoom as ThoughtDAG's plaques, applied to a paper's HTML (LaTeXML) version:
 

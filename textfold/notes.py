@@ -15,7 +15,7 @@ from . import kinds, langs, llm, store
 from .tokens import plain
 
 FORMAT, VERSION = "textfold/notes", 1   # (files written under earlier names say "paperfold/notes" or "dynamic-reader/notes")
-_LOCK = threading.Lock()   # the server answers on several threads; one writer at a time
+_LOCK = threading.RLock()   # merge an answer and save its note under the same lock
 _STOPPED = set()           # the questions the reader stopped (by their request's id), until their answers come back
 _STOP_LOCK = threading.Lock()
 
@@ -45,20 +45,18 @@ def kind(n):
 
 
 def read(pid):
-    f = _file(pid)
-    if f.exists():
-        return {**json.loads(store.read_text(f)), "format": FORMAT}   # (an older file's name for the same format, renewed)
-    meta = json.loads(store.read_text(store.pdir(pid) / "meta.json"))
+    document = store.document(pid)
+    if document.notes is not None:
+        return {**document.notes, "format": FORMAT}   # (an older file's name for the same format, renewed)
+    meta = document.meta
     return {"format": FORMAT, "version": VERSION,
             "paper": {"id": pid, "version": meta.get("version", ""), "title": meta.get("title", ""), "url": meta.get("abs_url", "")},
             "notes": []}
 
 
 def _write(pid, data):
-    f = _file(pid)
-    tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(f)
+    with store.edit(pid) as document:
+        document.notes = data
 
 
 def put(pid, note):
@@ -296,7 +294,10 @@ def ask(pid, nid, question, spec, timeout=300, ui=None, req=None):
     done = [t for t in turns(note) if t.get("a")]   # answered turns (a pending or failed one is being asked again)
     lang = next((t.get("lang") for t in turns(note) if t.get("lang")), None) or note["anchor"].get("lang") or "en"
     text, nums = prompt(doc, note, question, lang, done[-6:], ui if ui in langs.LANGS else None)
-    rec, _ = llm.call(text, ASK_SCHEMA, spec, store.pdir(pid) / "llm-cache", timeout=timeout, system=kinds.adapt(SYSTEM_ASK, doc["meta"]))
+    # Only file-based model caching borrows a workspace. It must close before
+    # the answer edits the latest notes, which may change during the model call.
+    with store.repository().workspace(pid) as folder:
+        rec, _ = llm.call(text, ASK_SCHEMA, spec, folder / "llm-cache", timeout=timeout, system=kinds.adapt(SYSTEM_ASK, doc["meta"]))
     out = rec["out"]
     answer, cites = _cited(out["answer"], nums, doc["units"])
     held = []   # the citations kept aside while an id written out in full (not as a citation) becomes its section
@@ -305,16 +306,21 @@ def ask(pid, nid, question, spec, timeout=300, ui=None, req=None):
     answer = re.sub("\ue000(\\d+)\ue001", lambda m: held[int(m.group(1))], bare)
     cites += [c for c in more if c not in cites]
     nxt = [re.sub(r"\s+", " ", CITE.sub("", q)).strip() for q in (out.get("next") or []) if isinstance(q, str)]
-    note["thread"] = done + [{"q": question, "a": answer, "takeaway": CITE.sub("", out["takeaway"]).strip(),
-                              "cites": cites, "next": [q for q in nxt if q][:2],
-                              "model": spec["id"], "lang": lang, "at": now()}]
-    note.pop("ask", None)
-    note["kind"] = "ask"
+    turn = {"q": question, "a": answer, "takeaway": CITE.sub("", out["takeaway"]).strip(),
+            "cites": cites, "next": [q for q in nxt if q][:2],
+            "model": spec["id"], "lang": lang, "at": now()}
     with _STOP_LOCK:   # (a stop and the answer crossing: the one second knows of the other)
         if req and req in _STOPPED:
             _STOPPED.discard(req)
             raise Stopped(req)
-        put(pid, note)
+        with _LOCK:
+            note = next((n for n in read(pid)["notes"] if n["id"] == nid), None)
+            if note is None:
+                raise ValueError("no such note")   # do not resurrect a deleted note
+            note["thread"] = [t for t in turns(note) if t.get("a")] + [turn]
+            note.pop("ask", None)
+            note["kind"] = "ask"
+            put(pid, note)
     return note
 
 
@@ -328,7 +334,7 @@ def reanchor(pid, old, new):
     where it was: on the edited paragraph it was on if that is still there, else on its section's title, so that the
     reader lists and shows it; the next replace looks for it again. A conversation's citations follow the paragraphs."""
     with _LOCK:
-        if not _file(pid).exists():
+        if store.document(pid).notes is None:
             return None
         data = read(pid)
         moves = Moves(old, new)

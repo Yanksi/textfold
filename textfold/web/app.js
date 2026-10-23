@@ -1472,10 +1472,36 @@
     const tests = {};         // the last connection test of each model: the levels' (gen), the questions' (ask)
     let bridgeStarting = false, bridgeState = null;
     const dlg = h('dialog', 'settings prefs'); document.body.append(dlg);
+    let storageDraft = null, storageBusy = false, storageError = '';
     dlg.addEventListener('close', () => { settingsOpen = false; });
     const T = () => t();
     const host = (u) => { try { return new URL(u).host; } catch { return u; } };
     const groupName = (g) => (data.agents.find((a) => a.runtime === g) || {}).label || (data.providers.find((p) => p.key === g) || {}).name || g;
+
+    function storageSection() {
+      const t = T(), s = data.storage;
+      if (!s) return `<h3>${esc(t.storage_title)}</h3><p class="st-note" role="status">${esc(t.st_scanning)}</p>`;
+      if (s.backend !== 'local') return `<h3>${esc(t.storage_title)}</h3><p class="st-note">${esc(s.backend)}</p>`;
+      return `<h3>${esc(t.storage_title)}</h3>
+        <div class="st-storage-current"><span class="st-meta">${esc(t.storage_current)}</span><code>${esc(s.path)}</code></div>
+        <div class="st-form st-storage-form"><label for="st-storage-path">${esc(t.storage_destination)}
+          <div class="st-storage-path"><input id="st-storage-path" class="st-storage-input" type="text" spellcheck="false" autocomplete="off" value="${esc(storageDraft ?? (s.pending || s.path))}"${storageBusy ? ' disabled' : ''}>
+          ${window.desktop && window.desktop.chooseLibraryFolder ? `<button type="button" class="st-btn st-storage-pick"${storageBusy ? ' disabled' : ''}>${esc(t.storage_choose)}</button>` : ''}</div></label>
+          <p class="st-note">${esc(t.storage_explain)}</p>
+          ${s.pending ? `<p class="st-note ok" role="status">${esc(t.storage_pending)} <code>${esc(s.pending)}</code></p>` : ''}
+          ${storageError || s.error ? `<p class="st-note warn" role="alert">${esc(storageErrorMessage(storageError || s.error))}</p>` : ''}
+          <div class="st-row end">${s.pending ? `<button type="button" class="st-btn st-storage-cancel"${storageBusy ? ' disabled' : ''}>${esc(t.storage_cancel)}</button>` : ''}
+          <button type="button" class="st-btn st-storage-save"${storageBusy ? ' disabled' : ''}>${esc(storageBusy ? t.storage_saving : t.storage_save)}</button></div>
+        </div>`;
+    }
+
+    function storageErrorMessage(message) {
+      const t = T();
+      if (/absolute.*path/i.test(message)) return t.storage_absolute;
+      if (/empty folder/i.test(message)) return t.storage_empty;
+      if (/contain, or be inside|overlapping/i.test(message)) return t.storage_overlap;
+      return message;
+    }
 
     function modelSection() {
       const t = T();
@@ -1581,6 +1607,7 @@
         <section><h3>${esc(t.st_models_h)}</h3><div class="st-model-area">${modelSection()}${discoveryState()}</div></section>
         <section><h3>${esc(t.st_agents)}</h3><div class="st-agent-area">${loaded ? agentSection() : ''}</div></section>
         <section><h3>${esc(t.st_providers)}</h3><div class="st-provider-area">${loaded ? providerSection() : ''}</div></section>
+        <section class="st-storage">${storageSection()}</section>
         <section class="st-engine"></section>
         </div>
         <footer class="stp-foot"><p>${esc(t.key_note)}</p><button type="button" class="primary st-close">${esc(t.st_close)}</button></footer></div>`;
@@ -1650,6 +1677,27 @@
     }
 
     function wire() {
+      const storageInput = q('.st-storage-input'), storagePick = q('.st-storage-pick');
+      if (storageInput) storageInput.oninput = () => { storageDraft = storageInput.value; };
+      if (storagePick) storagePick.onclick = async () => {
+        try {
+          const path = await window.desktop.chooseLibraryFolder();
+          if (path) { storageDraft = path; render(); }
+        } catch (error) { storageError = error.message; render(); }
+      };
+      const saveStorage = async (cancel) => {
+        storageDraft = storageInput ? storageInput.value : storageDraft;
+        storageBusy = true; storageError = ''; render();
+        try {
+          data.storage = await api('/api/storage', cancel ? { cancel: true } : { path: storageDraft });
+          storageDraft = data.storage.pending || data.storage.path;
+        } catch (error) { storageError = error.message; }
+        storageBusy = false;
+        if (dlg.isConnected) render();
+      };
+      const storageSave = q('.st-storage-save'), storageCancel = q('.st-storage-cancel');
+      if (storageSave) storageSave.onclick = () => saveStorage(false);
+      if (storageCancel) storageCancel.onclick = () => saveStorage(true);
       const retry = q('.st-retry');
       if (retry) retry.onclick = discover;
       dlg.querySelectorAll('.st-close').forEach((b) => { b.onclick = () => dlg.close(); });

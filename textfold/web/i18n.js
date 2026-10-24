@@ -699,6 +699,24 @@ window.DR_I18N = (() => {
     hi: rds(["रूप", "शैली", "सिस्टम जैसा", "हल्का", "गहरा", "सामान्य", "कागज़", "पंक्ति अंतर", "सघन", "खुला", "फ़ोकस मोड", "फ़ोकस मोड: बाहर निकलने के लिए F या Esc", "आप वहीं लौट आए जहाँ छोड़ा था", "शुरू से"]),
   };
   for (const [code, words] of Object.entries(RDS)) Object.assign(S[code], words);
+  // the colour of the highlights made at each level (Aa), with a warning when two levels have one, and a highlight's
+  // shade (the dots after Highlight, over a selection and in a note opened)
+  const hls = (w) => ({ ty_hl: w[0], ty_same: w[1], n_shade: w[2], n_shades: w[3], n_hues: w[4] });
+  const HLS = {
+    en: hls(["Highlights", "{a} and {b} have the same colour: a highlight no longer shows which level it was made at", "Shade", ["Light", "Medium", "Deep"], ["Yellow", "Orange", "Red", "Pink", "Purple", "Blue", "Teal", "Green"]]),
+    zh: hls(["高光颜色", "「{a}」和「{b}」同色：看高光分不出是在哪一层划的", "深浅", ["浅", "中", "深"], ["黄", "橙", "红", "粉", "紫", "蓝", "青", "绿"]]),
+    "zh-Hant": hls(["標亮顏色", "「{a}」和「{b}」同色：看標亮分不出是在哪一層劃的", "深淺", ["淺", "中", "深"], ["黃", "橙", "紅", "粉", "紫", "藍", "青", "綠"]]),
+    ja: hls(["ハイライトの色", "{a}と{b}が同じ色です：どのレベルで引いたハイライトか見分けられません", "濃さ", ["淡", "中", "濃"], ["黄", "オレンジ", "赤", "ピンク", "紫", "青", "青緑", "緑"]]),
+    ko: hls(["하이라이트 색", "{a}와(과) {b}의 색이 같습니다: 어느 단계에서 한 하이라이트인지 구별되지 않습니다", "농도", ["연하게", "보통", "진하게"], ["노랑", "주황", "빨강", "분홍", "보라", "파랑", "청록", "초록"]]),
+    es: hls(["Resaltados", "{a} y {b} tienen el mismo color: un resaltado ya no indica en qué nivel se hizo", "Intensidad", ["Suave", "Media", "Intensa"], ["Amarillo", "Naranja", "Rojo", "Rosa", "Morado", "Azul", "Turquesa", "Verde"]]),
+    fr: hls(["Surlignages", "{a} et {b} ont la même couleur : un surlignage ne dit plus à quel niveau il a été fait", "Intensité", ["Clair", "Moyen", "Foncé"], ["Jaune", "Orange", "Rouge", "Rose", "Violet", "Bleu", "Turquoise", "Vert"]]),
+    de: hls(["Markierungen", "{a} und {b} haben dieselbe Farbe: Eine Markierung zeigt nicht mehr, auf welcher Stufe sie gesetzt wurde", "Intensität", ["Hell", "Mittel", "Kräftig"], ["Gelb", "Orange", "Rot", "Rosa", "Lila", "Blau", "Türkis", "Grün"]]),
+    pt: hls(["Destaques", "{a} e {b} têm a mesma cor: um destaque já não mostra em que nível foi feito", "Intensidade", ["Clara", "Média", "Forte"], ["Amarelo", "Laranja", "Vermelho", "Rosa", "Roxo", "Azul", "Turquesa", "Verde"]]),
+    it: hls(["Evidenziazioni", "{a} e {b} hanno lo stesso colore: un’evidenziazione non dice più a quale livello è stata fatta", "Intensità", ["Chiara", "Media", "Intensa"], ["Giallo", "Arancione", "Rosso", "Rosa", "Viola", "Blu", "Turchese", "Verde"]]),
+    ru: hls(["Выделения", "У «{a}» и «{b}» один цвет: по выделению не видно, на каком уровне оно сделано", "Насыщенность", ["Светлый", "Средний", "Насыщенный"], ["Жёлтый", "Оранжевый", "Красный", "Розовый", "Фиолетовый", "Синий", "Бирюзовый", "Зелёный"]]),
+    hi: hls(["हाइलाइट के रंग", "{a} और {b} का रंग एक है: हाइलाइट से पता नहीं चलता कि वह किस स्तर पर किया गया", "गहराई", ["हल्का", "मध्यम", "गहरा"], ["पीला", "नारंगी", "लाल", "गुलाबी", "बैंगनी", "नीला", "फ़िरोज़ी", "हरा"]]),
+  };
+  for (const [code, words] of Object.entries(HLS)) Object.assign(S[code], words);
   // the button under a drawing whose words the browser set out of place: the figure as the paper's PDF has it
   const pdfs = (w) => ({ fig_pdf: w[0], fig_pdf_busy: w[1], fig_pdf_none: w[2], fig_pdf_fail: w[3] });
   const PDFS = {

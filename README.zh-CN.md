@@ -263,8 +263,13 @@ pi install ./textfold/plugins/pi-textfold
 
 ## 最新
 
+- **2026 年 10 月 24 日：高光分深浅；印地语按印地语来读。** 高光仍是划它的那一层的颜色，再分浅、中、深三档：在选中文字上方的工具条里点 **高光** 旁边的圆点，或者打开笔记再改。**Aa** 里每一层的颜色可以从八种里选。把主题卡片拖进笔记时，标题下面的摘要也一起带过去。印地语的词不再被拆开，句子在 danda（।）处结束。公式里 `\text{}` 中的文字照原样显示（50% off，而不是 `50\% off`），Word 公式里的普通文本也不会再让整个公式出错。Markdown 文档的 front matter 按 Quarto 的写法给出作者，不再把作者单位当成作者。感谢 [@vcdim](https://github.com/vcdim)、[@Pharex38](https://github.com/Pharex38) 和 [@adalach](https://github.com/adalach)。
 - **2026 年 10 月 23 日：链接一直指得准；Windows 上找得到 WorkBuddy。** 段落和章节的 id 在文档的整个生命周期里都不变：改了文字、PDF 重新转换、TextFold 升级以后都一样。所以从 Obsidian 或笔记里点过来的链接，还能打开原来的地方。指向已经不在文中的段落的链接，会打开它原来所在的章节，并提示一句。在 Windows 上，WorkBuddy 5.8 又能找到了，装在哪个盘都行。感谢 [@adalach](https://github.com/adalach) 和 [@LyotoDS](https://github.com/LyotoDS)。
 - **2026 年 10 月 23 日：划了什么就亮什么。** 在关键句和要点层划的高光，选中的字全部亮起，模型写的词也亮。以前只亮由原文来的词，只选了模型的话时一个都不亮。每层一种颜色：全文和简述是黄色，关键句是紫色，要点是蓝色。层与层不再互相点亮，**保留我的高光** 照旧把原文的高光带到关键句和要点层。笔记框里按 Enter 保存并关闭，Shift+Enter 换行（手机上按 Enter 换行）。换一篇文档时不再重新下载应用的脚本和样式，在服务器上部署、用手机读时最明显。感谢 [@adalach](https://github.com/adalach) 和 [@LumenYoung](https://github.com/LumenYoung)。
+
+<details>
+<summary>更早</summary>
+
 - **2026 年 10 月 22 日：精确转换后语言和笔记都在；手机上更好读。** PDF 重新精确转换后，原来有的每种语言都会按新文本重新生成，你在上面做的笔记也会跟着原文找到新的位置。快速转换时的翻译不会再落到新文本上（显示为已过期，而且对不上段落）。过期的翻译在语言菜单最上面有 **更新**。在手机上，打开侧栏的按钮不再压住标志，很宽的公式在自己的框里横向滚动。Markdown 文档和转换来的 PDF 里的长公式在任何屏幕上都保留公式框，在列表里也会显示。指向拆开的段落后半部分的 `textfold://` 链接能打开了。感谢 [@LumenYoung](https://github.com/LumenYoung) 和 [@adalach](https://github.com/adalach)。
 - **2026 年 10 月 22 日：按 TeX 原样显示的图；全屏。** arXiv 论文里由浏览器排字的图（TikZ 画的图）有时字会溢出框，arXiv 自己的网页也一样。这类图下面有一个按钮，点了就从论文的 PDF 里取 TeX 排好的原图，不点就不下载；换过的图下面可以一键换回来。**Aa** 里可以 **全屏**；对照原文时也能打开主题层的导图。简述层里进入下一层的词和其他词的深浅差小了一些，纸张风格的字色和默认风格一致。
 - **2026 年 10 月 22 日：更省磁盘空间。** 新进来的图片存成 WebP：一篇 arXiv 论文的插图只占原来五分之一甚至更少，而且同时下载 4 张，新论文打开更快。文献库里已有的图片保持原样。应用为显示过的图片和 PDF 留的缓存不超过 32 MB，更新安装好以后会删掉下载的安装包。删除的文档在 papers/.trash 里保留 30 天，之后彻底清除。在关键句和要点层，由几个子图组成的插图改为并排显示，不再上下叠在一起被截断。
@@ -280,10 +285,6 @@ pi install ./textfold/plugins/pi-textfold
 - **2026 年 10 月 15 日：不装 PDF 引擎也能读 PDF。** 自带文字的 PDF（大多数论文都是）直接打开，图从原页上裁出来；只有扫描件还需要 PDF 引擎。没有 HTML 版本的 arXiv 论文改读它的 PDF。感谢 [@sylvainHellin](https://github.com/sylvainHellin)。
 - **2026 年 10 月 15 日：你的文献库和你的提问。** 文献库可以搜索、建文件夹，按添加时间或最近打开排序。提问有了发送和停止键，对话里任何一轮都可以删掉，回答问题还可以用比生成层级更强的模型。感谢 [@suhyungJang](https://github.com/suhyungJang)。
 - **2026 年 10 月 14 日：Mac 和 Windows 软件。** 下载 TextFold 的 macOS 版（Apple 芯片或 Intel，已签名并经苹果公证）或 Windows 版，需要的东西都在里面。它会找到你电脑上的 Claude Code、Codex 或 Pi，有新版本时经你同意自己更新。[下载 ↓](#开始使用)
-
-<details>
-<summary>更早</summary>
-
 - **2026 年 10 月 14 日：直接读你的 Zotero 文献库。** 拖放框下面的 **Zotero 文献库** 按 Zotero 里的样子列出你的文献库和分类，任何条目点一下就能打开：arXiv 上有就读 arXiv，没有就读它自己的 PDF。感谢 [@adalach](https://github.com/adalach)。[直接读你的 Zotero ↑](#直接读你的-zotero)
 - **2026 年 10 月 14 日：读 arXiv 页面更安全了。** 页面里可能运行脚本的部分，会在阅读器显示之前去掉，图都保持原样。感谢 [@neil-patel77](https://github.com/neil-patel77)。
 - **2026 年 10 月 13 日：把一页存成一个文件。** 阅读页顶部的 **保存** 把整页存成一个 HTML 文件，可以带上标注和原文 PDF；也可以只存标注。[保存一页 ↓](#保存一页)
@@ -317,6 +318,8 @@ pi install ./textfold/plugins/pi-textfold
 <a href="https://github.com/Knoety" title="@Knoety"><img src="https://github.com/Knoety.png?size=80" width="40" height="40" alt="@Knoety" /></a>
 <a href="https://github.com/LumenYoung" title="@LumenYoung"><img src="https://github.com/LumenYoung.png?size=80" width="40" height="40" alt="@LumenYoung" /></a>
 <a href="https://github.com/LyotoDS" title="@LyotoDS"><img src="https://github.com/LyotoDS.png?size=80" width="40" height="40" alt="@LyotoDS" /></a>
+<a href="https://github.com/Pharex38" title="@Pharex38"><img src="https://github.com/Pharex38.png?size=80" width="40" height="40" alt="@Pharex38" /></a>
+<a href="https://github.com/vcdim" title="@vcdim"><img src="https://github.com/vcdim.png?size=80" width="40" height="40" alt="@vcdim" /></a>
 
 欢迎贡献：先看 [CONTRIBUTING.md](https://github.com/chenxiachan/textfold/blob/main/CONTRIBUTING.md)。
 

@@ -451,7 +451,7 @@ class HttpNotifications(unittest.TestCase):
         from pathlib import Path
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(temp.name).resolve()
         self.a, self.b = self.device('a'), self.device('b')
         self.addCleanup(self.a.close)
         self.addCleanup(self.b.close)

@@ -19,10 +19,11 @@ import locale
 import os
 import re
 import sys
+import shutil
 import time
 from pathlib import Path
 from .storage import DocumentStore, LocalDirectoryBackend
-from ._storage_layout import decode_text
+from ._storage_layout import decode_text, DirectoryFiles
 
 from . import ladder
 
@@ -153,7 +154,7 @@ def repository():
         from .storage_settings import active_path
         # Embedders and existing tests that explicitly replace DATA get an
         # isolated library, never a persisted selection from the user's home.
-        root = active_path(DATA, HOME) if Path(DATA) == Path(_DEFAULT_DATA) else DATA
+        root = active_path(DATA, DATA) if Path(DATA) == Path(_DEFAULT_DATA) else DATA
         from .cloud_settings import configured
         cloud = configured(HOME, DATA) if Path(DATA) == Path(_DEFAULT_DATA) else None
         _repository = DocumentStore(cloud or LocalDirectoryBackend(root))
@@ -192,7 +193,25 @@ def edit(pid, create=False):
     return repository().edit(pid, create=create)
 
 
+def is_local():
+    return isinstance(repository().backend, LocalDirectoryBackend)
+
+
+def _nonlocal():
+    return not is_local()
+
+
+def _custom():
+    return _repository is not None and _repository_default is None
+
+
+def library_root():
+    return repository().backend.root
+
+
 def has(pid, name="meta.json"):
+    if is_local():
+        return repository().has(pid, name) if _nonlocal() else DirectoryFiles(pdir(pid)).exists(name)
     if name == "meta.json":
         try:
             repository().info(pid)
@@ -204,6 +223,8 @@ def has(pid, name="meta.json"):
 
 
 def readable(pid):
+    if is_local():
+        return repository().info(pid).readable if _nonlocal() else has(pid, 'meta.json') and has(pid, 'source.html')
     try:
         return repository().info(pid).readable
     except FileNotFoundError:
@@ -220,6 +241,10 @@ def keep_original(pid, format, data, only_if_missing=False):
 
 
 def asset(pid, name):
+    if is_local():
+        if not _nonlocal():
+            return DirectoryFiles(pdir(pid)).read(name)
+        return repository().read_asset(pid, name)
     return repository().read_asset(pid, name)
 
 
@@ -228,6 +253,10 @@ def put_asset(pid, name, data):
 
 
 def text(pid, name):
+    if is_local():
+        if not _nonlocal():
+            return read_text(DirectoryFiles(pdir(pid)).path(name))
+            return decode_text(asset(pid, name))
     return decode_text(asset(pid, name))
 
 
@@ -235,21 +264,21 @@ def storage_status():
     from . import storage_settings
     backend = repository().backend
     if not isinstance(backend, LocalDirectoryBackend):
-        local = storage_settings.status(storage_settings.active_path(DATA, HOME), HOME)
+        local = storage_settings.status(storage_settings.active_path(DATA, DATA), DATA)
         return {"backend": getattr(backend, "name", "custom"), "path": "", "pending": "", "error": "", "local": local}
-    return storage_settings.status(backend.root, HOME)
+    return storage_settings.status(backend.root, DATA)
 
 
-def schedule_storage(path=None, cancel=False):
+def schedule_storage(path=None, cancel=False, mode="copy"):
     from . import storage_settings
     backend = repository().backend
     if not isinstance(backend, LocalDirectoryBackend):
         from .offline_storage import OfflineBackend
         if not isinstance(backend, OfflineBackend):
             raise ValueError("The selected backend does not expose a local folder setting")
-        storage_settings.schedule(storage_settings.active_path(DATA, HOME), HOME, path, cancel)
+        storage_settings.schedule(storage_settings.active_path(DATA, DATA), DATA, path, cancel, mode)
         return storage_status()
-    return storage_settings.schedule(backend.root, HOME, path, cancel)
+    return storage_settings.schedule(backend.root, DATA, path, cancel, mode)
 
 
 def initialize_storage():
@@ -261,7 +290,7 @@ def initialize_storage():
     cloud = configured(HOME, DATA) if Path(DATA) == Path(_DEFAULT_DATA) else None
     from . import storage_settings
     # Cloud selection must not activate a scheduled local-folder migration.
-    root = None if cloud else storage_settings.activate(DATA, HOME)
+    root = None if cloud else storage_settings.activate(DATA, DATA)
     _repository = DocumentStore(cloud or LocalDirectoryBackend(root))
     _repository_default = (Path(DATA), Path(HOME))
 
@@ -273,7 +302,17 @@ def discard_document(pid):
         pass
 
 
+def _file(pid, name):
+    return pdir(pid) / "layers" / f"{name}.json"
+
+
 def read(pid, name):
+    if is_local():
+        if _nonlocal():
+            try: return document(pid).layers.get(name)
+            except FileNotFoundError: return None
+        f = _file(pid, name)
+        return json.loads(read_text(f)) if f.exists() else None
     try:
         return document(pid).layers.get(name)
     except FileNotFoundError:
@@ -281,6 +320,16 @@ def read(pid, name):
 
 
 def write(pid, name, data):
+    if is_local():
+        if _nonlocal():
+            with edit(pid, create=True) as saved:
+                saved.layers[name] = data
+            return
+        f = _file(pid, name)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(f)
     with edit(pid) as doc:
         doc.layers[name] = data
 
@@ -330,10 +379,21 @@ def apply_tr(doc, lang, tr):
 
 
 def languages(pid):
+    if is_local():
+        if _nonlocal():
+            return sorted(k[3:] for k in document(pid).layers if k.startswith('tr-'))
+        d = pdir(pid) / "layers"
+        return sorted(f.stem[3:] for f in d.glob("tr-*.json")) if d.exists() else []
     return sorted(k[3:] for k in document(pid).layers if k.startswith("tr-"))
 
 
 def parsed(pid):
+    if is_local():
+        if _nonlocal():
+            saved = document(pid)
+            return parse(saved.source.html, saved.meta)
+        d = pdir(pid)
+        return parse(read_text(d / "source.html"), json.loads(read_text(d / "meta.json")))
     doc = document(pid)
     if doc.source.html is None or doc.meta is None:
         raise FileNotFoundError(pid)
@@ -341,6 +401,38 @@ def parsed(pid):
 
 
 def assemble(pid, only=None):
+    if is_local():
+        """The paper as the reader needs it, from the layers alone (no model call). only: the translations to carry (a page
+        saved in one language), else all of them."""
+        doc = parsed(pid)
+        en = read(pid, "en")
+        meta = doc["meta"]
+        meta["langs"], meta["stale"], meta["versions"] = [], [], {}
+        cjk = ladder.cjk_doc(doc)
+        if cjk:   # the reader's CJK rules (an English paper's page carries nothing new)
+            meta["cjk"] = True
+        if en:
+            apply_en(doc, en)
+            meta["langs"].append("en")
+            meta["versions"]["en"] = en["version"]
+        else:
+            for u in doc["units"].values():
+                u["lad"] = ladder.local(u, doc["atoms"], cjk)
+        for lang in languages(pid):
+            if only is not None and lang not in only:
+                continue
+            tr = read(pid, f"tr-{lang}")
+            apply_tr(doc, lang, tr)
+            meta["langs"].append(lang)
+            meta["versions"][lang] = tr["version"]
+            if not en or tr.get("base") != en["version"]:
+                meta["stale"].append(lang)
+            else:   # paragraphs it has no translation for (a call that failed): asked for when it is generated again
+                from .translate import gaps   # (translate imports ladder and llm, which read through this module)
+                n = len(gaps(doc, lang))
+                if n:
+                    meta.setdefault("gaps", {})[lang] = n
+        return doc
     """The paper as the reader needs it, from the layers alone (no model call). only: the translations to carry (a page
     saved in one language), else all of them."""
     saved = document(pid)
@@ -378,6 +470,34 @@ def assemble(pid, only=None):
 
 
 def papers(index=None):
+    if is_local():
+        if _nonlocal():
+            return sorted([{'id': i.id, 'title': i.meta['title'], 'titles': i.titles,
+                            'authors': i.meta.get('authors', []), 'langs': i.languages,
+                            'updated': i.updated, 'notes': i.note_count} for i in repository().list()],
+                          key=lambda item: -item['updated'])
+        """Every paper on disk, newest layer first."""
+        out = []
+        root = library_root() / "papers"
+        for d in root.iterdir() if root.exists() else []:
+            mf = d / "meta.json"
+            if d.name.startswith(".") or not mf.exists():
+                continue
+            meta = json.loads(read_text(mf))
+            en = read(d.name, "en")
+            langs_ = (["en"] if en else []) + languages(d.name)
+            titles = {}
+            for lang in languages(d.name):
+                t = (read(d.name, f"tr-{lang}") or {}).get("title")
+                if t:
+                    titles[lang] = t
+            mtimes = [f.stat().st_mtime for f in (d / "layers").glob("*.json")] if (d / "layers").exists() else []
+            nf = d / "notes.json"
+            out.append({"id": d.name, "title": meta["title"], "titles": titles, "authors": meta.get("authors", []),
+                        "langs": langs_, "updated": max(mtimes) if mtimes else mf.stat().st_mtime,
+                        "notes": len(json.loads(read_text(nf)).get("notes", [])) if nf.exists() else 0,
+                        **({"zotero": True} if meta.get("zotero") else {})})
+        return sorted(out, key=lambda p: -p["updated"])
     """The backend's document index, without loading originals or attachments."""
     out = []
     for info in repository().list() if index is None else index:
@@ -390,10 +510,41 @@ def papers(index=None):
 
 
 def trash(pid, kept=None):
+    if is_local():
+        """Delete a paper from the list: its folder (source, layers, model replies, notes) moves to papers/.trash, from
+        where it can be moved back (untrash, or by hand) for 30 days (empty_trash). kept: its place in the library, kept
+        with it."""
+        if _nonlocal():
+            return repository().backend.trash(pid, kept)
+        to = library_root() / "papers" / ".trash" / f"{pid}-{time.strftime('%Y%m%d-%H%M%S')}"
+        to.parent.mkdir(parents=True, exist_ok=True)
+        pdir(pid).rename(to)
+        if kept:
+            (to / "library.json").write_text(json.dumps(kept, ensure_ascii=False), encoding="utf-8")
+        return to
     return repository().backend.trash(pid, kept)
 
 
 def untrash(pid):
+    if is_local():
+        """A paper deleted last back in the list, as it was (its latest time in papers/.trash), and its place in the
+        library as trash kept it ({} when none); None when there is none there, or a paper of that id is listed again."""
+        if _nonlocal():
+            return repository().backend.restore(pid)
+        if not valid_id(pid) or pdir(pid).exists():
+            return None
+        at = re.compile(re.escape(pid) + r"-\d{8}-\d{6}")
+        gone = sorted(d for d in (library_root() / "papers" / ".trash").glob(f"{pid}-*") if at.fullmatch(d.name) and (d / "meta.json").exists())
+        if not gone:
+            return None
+        kept_f = gone[-1] / "library.json"
+        try:
+            kept = json.loads(read_text(kept_f)) if kept_f.exists() else {}
+        except (OSError, ValueError):
+            kept = {}
+        gone[-1].rename(pdir(pid))
+        (pdir(pid) / "library.json").unlink(missing_ok=True)
+        return kept if isinstance(kept, dict) else {}
     if not valid_id(pid):
         return None
     return repository().backend.restore(pid)
@@ -403,5 +554,28 @@ TRASH_DAYS = 30
 
 
 def empty_trash(days=TRASH_DAYS, now=None):
+    if is_local():
+        """Papers deleted more than `days` ago erased from papers/.trash, by the time in their folder's name (trash's);
+        nothing else there is touched. The server does it as it starts. Their names, erased."""
+        if _nonlocal():
+            return repository().backend.purge((time.time() if now is None else now) - days * 86400)
+        root = library_root() / "papers" / ".trash"
+        if not root.is_dir():
+            return []
+        cut = (time.time() if now is None else now) - days * 86400
+        gone = []
+        for d in sorted(root.iterdir()):
+            m = re.fullmatch(r"(.+)-(\d{8}-\d{6})", d.name)
+            if not (m and valid_id(m.group(1)) and d.is_dir() and not d.is_symlink()):
+                continue
+            try:
+                at = time.mktime(time.strptime(m.group(2), "%Y%m%d-%H%M%S"))
+            except (ValueError, OverflowError):
+                continue
+            if at < cut:
+                shutil.rmtree(d, ignore_errors=True)
+                if not d.exists():
+                    gone.append(d.name)
+        return gone
     before = (time.time() if now is None else now) - days * 86400
     return repository().backend.purge(before)

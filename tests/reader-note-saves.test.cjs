@@ -6,8 +6,10 @@ const vm = require('node:vm');
 
 function reader(post) {
   const original = { id: 'n-one', anchor: { unit: 'p1' }, text: 'Original', color: 'yellow', _base: { text: 'Original' } };
-  const alerts = [], calls = [];
+  const alerts = [], calls = [], boxes = [];
+  const document = { querySelector: () => boxes[0] || null, createElement: () => ({ setAttribute() {}, set textContent(value) { alerts.push(value); }, hidden: false }), body: { append: box => boxes.push(box) } };
   const context = vm.createContext({
+    document,
     notes: [original], acknowledged: new Map([[original.id, original]]), noteSaves: new Map(), failedNoteFields: new Map(),
     D: { app: true, meta: { id: 'md-review' } }, indexNotes() {}, notesChanged() {}, keyOf() { return 'p1'; },
     popNote: null, T: { en: { sync_save_failed: 'Save failed' } }, ui: 'en', alert: message => alerts.push(message),
@@ -18,7 +20,8 @@ function reader(post) {
   const start = source.indexOf('  function saveNote(n)'), deletion = source.indexOf('  function deleteNote(n)', start);
   const end = source.indexOf('\n  }', deletion) + 5;
   assert.ok(start >= 0 && end > start);
-  vm.runInContext(source.slice(start, end), context);
+  const errorStart = source.indexOf('  function saveError(error)'), errorEnd = source.indexOf('  const noteSaves', errorStart);
+  vm.runInContext(source.slice(errorStart, errorEnd) + source.slice(start, end), context);
   return { context, calls, alerts, original };
 }
 

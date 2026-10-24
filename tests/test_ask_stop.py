@@ -61,6 +61,24 @@ class AskStop(unittest.TestCase):
             self.ask("r-mine")
         self.assertEqual(len(self.thread()), 2)
 
+
+
+
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class CloudAsk(AskStop):
+    def setUp(self):
+        super().setUp()
+        from textfold.sqlite_storage import SQLiteBackend
+        from textfold.documents import Document
+        backend = SQLiteBackend(store.DATA / "cloud-workspace")
+        document = store.document(PID); document.revision = None
+        backend.save(document)
+        context = store.use_backend(backend); context.__enter__(); self.addCleanup(context.__exit__, None, None, None)
+
     def test_completed_request_is_not_sent_to_model_again(self):
         with mock.patch.object(llm, 'call', return_value=(REPLY, None)) as called:
             self.ask('r-replay'); self.ask('r-replay')
@@ -107,6 +125,14 @@ class AskStop(unittest.TestCase):
         self.assertEqual(data['notes'], [])
         self.assertEqual(data['conflicts'][0]['variants'][1]['text'], 'Edit made after deletion')
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_cancel_pending_cloud_question_does_not_recreate_it_from_thread(self):
+        note = notes.read(PID)['notes'][0]
+        from textfold import sync_records
+        nodes = sync_records.messages(note); parent = note['thread'][-1]['message_id']
+        note['messages'] = nodes + [{'id':'r-cancel-q','parent':parent,'role':'user','text':'Pending','pending':True},
+            {'id':'r-cancel-a','parent':'r-cancel-q','role':'assistant','text':'','pending':True}]
+        note['thread'] = note['thread'] + [{'q':'Pending','a':'','pending':True}]
+        notes.put(PID,note); notes.cancel_question(PID,note['id'],'r-cancel')
+        saved = notes.read(PID)['notes'][0]
+        self.assertEqual([t['q'] for t in saved['thread']], ['What is asked first?'])
+        self.assertFalse(any(m['id'].startswith('r-cancel') for m in saved['messages']))

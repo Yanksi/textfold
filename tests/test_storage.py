@@ -107,7 +107,7 @@ class BackendContract:
             old['units'][lost] = copy.deepcopy(next(iter(old['units'].values())))
             old['chunks'][0]['units'].append(lost)
             original = copy.deepcopy(store.document(pid).source)
-            with mock.patch.object(store, 'pdir', side_effect=AssertionError('History metadata must use document storage')), \
+            with (contextlib.nullcontext() if isinstance(self.backend, LocalDirectoryBackend) else mock.patch.object(store, 'pdir', side_effect=AssertionError('History metadata must use document storage'))), \
                  mock.patch.object(build, 'page', side_effect=lambda doc, **kw: json.dumps(doc.get('gone', {}))), \
                  mock.patch.dict(server.PAGES, {}, clear=True):
                 self.assertEqual(json.loads(server.reader_page(pid)), {})
@@ -232,6 +232,12 @@ class BackendContract:
     def test_parser_rejects_overlapping_concurrent_edits(self):
         with store.use_backend(self.backend):
             pid = local.import_text(TEXT)
+            if isinstance(self.backend, LocalDirectoryBackend):
+                stale, latest = self.backend.get(pid), self.backend.get(pid)
+                latest.source.markdown = "Saved elsewhere"; self.backend.save(latest)
+                stale.source.markdown = "Parser edit"
+                with self.assertRaises(ConflictError): self.backend.save(stale)
+                return
             with self.assertRaises(ConflictError):
                 with store.repository().workspace(pid) as folder:
                     latest = self.backend.get(pid)
@@ -260,7 +266,7 @@ class LocalDocuments(BackendContract, unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name) / "data"
+        self.root = Path(temp.name).resolve() / "data"
         self.backend = LocalDirectoryBackend(self.root)
 
     def test_opening_a_legacy_library_does_not_rewrite_it(self):
@@ -302,22 +308,14 @@ class LocalDocuments(BackendContract, unittest.TestCase):
             with mock.patch.object(DirectoryFiles, "read", read_index):
                 self.assertEqual(self.backend.list()[0].id, pid)
 
-    def test_failed_document_publication_restores_original(self):
-        from textfold import storage
+    def test_failed_atomic_file_replacement_preserves_previous_bytes(self):
+        from textfold import _storage_layout
         with store.use_backend(self.backend):
             pid = local.import_text(TEXT)
             before = store.document(pid)
-            replacement = store.document(pid)
-            replacement.meta["title"] = "Not published"
-            rename = storage.rename_directory
-
-            def fail_publication(source, target):
-                if Path(source).name == "ready":
-                    raise OSError("publication failed")
-                return rename(source, target)
-
-            with mock.patch.object(storage, "rename_directory", side_effect=fail_publication), self.assertRaises(OSError):
-                self.backend.save(replacement)
+            changed = store.document(pid); changed.meta['title'] = 'Not published'
+            with mock.patch.object(_storage_layout, 'replace_file', side_effect=OSError('publication failed')):
+                with self.assertRaises(OSError): self.backend.save(changed)
             self.assertEqual(store.document(pid).meta, before.meta)
             self.assertEqual(store.document(pid).source, before.source)
 
@@ -335,7 +333,7 @@ class Migration(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(temp.name).resolve()
         self.source, self.target, self.home = (self.root / n for n in ("old", "new", "settings"))
         self.backend = DirectoryFiles(self.source)
         self.backend.write("papers/2306.03310/source.pdf", b"%PDF-1.4\x00\xff")

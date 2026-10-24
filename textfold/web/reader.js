@@ -1867,7 +1867,19 @@
       }
       return d;
     });
-  const noteId = () => 'n-' + crypto.randomUUID();
+  const noteId = () => {
+    if (globalThis.crypto?.randomUUID) return 'n-' + crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    if (globalThis.crypto?.getRandomValues) crypto.getRandomValues(bytes);
+    else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+    return 'n-' + [...bytes].map((x) => x.toString(16).padStart(2, '0')).join('');
+  };
+  function saveError(error) {
+    let box = document.querySelector('.note-save-error');
+    if (!box) { box = document.createElement('div'); box.className = 'note-save-error'; box.setAttribute('role', 'alert'); document.body.append(box); }
+    box.textContent = `${T[ui].sync_save_failed} ${error.message}`;
+    box.hidden = false;
+  }
   const noteSaves = new Map(), acknowledged = new Map(), failedNoteFields = new Map();
   // a note's target: a paragraph (its id), a section ("§" and its id: its one-line summary, or its title), or the
   // whole paper ("¶": a conversation from the chat, with no passage)
@@ -1988,7 +2000,7 @@
     indexNotes();
     notesChanged([keyOf(n.anchor), ...(before ? [keyOf(before.anchor)] : [])]);
     if (!D.app) { store.set(NOTES_KEY, JSON.stringify(notes)); return Promise.resolve(); }
-    const ignored = new Set(['_base', '_revision', 'messages', 'thread', 'ask', 'branches']);
+    const ignored = new Set(['_base', '_revision', 'messages', 'branches']);
     const intent = Object.keys(n).filter((k) => !ignored.has(k) && JSON.stringify(n[k]) !== JSON.stringify(before?.[k]));
     const task = (noteSaves.get(n.id) || Promise.resolve()).catch(() => {}).then(async () => {
       const ack = acknowledged.get(n.id);
@@ -2004,6 +2016,7 @@
       try { data = await post(`/api/notes/${D.meta.id}`, { op: 'put', note: payload }); }
       catch (error) { failedNoteFields.set(n.id, fields); throw error; }
       failedNoteFields.delete(n.id);
+      const saveErrorBox = document.querySelector('.note-save-error'); if (saveErrorBox) saveErrorBox.hidden = true;
       const id = data.aliases?.[n.id] || n.id, saved = data.notes.find((x) => x.id === id);
       if (saved) {
         acknowledged.set(n.id, saved);
@@ -2017,7 +2030,7 @@
     noteSaves.set(n.id, task);
     task.then(() => { if (noteSaves.get(n.id) === task) noteSaves.delete(n.id); }, (error) => {
       if (noteSaves.get(n.id) === task) noteSaves.delete(n.id);
-      alert(`${T[ui].sync_save_failed}\n${error.message}`);
+      saveError(error);
     });
     return task;
   }
@@ -2031,7 +2044,7 @@
       failedNoteFields.delete(n.id); acknowledged.delete(n.id);
       return data;
     });
-    task.catch((error) => alert(`${T[ui].sync_save_failed}\n${error.message}`));
+    task.catch((error) => saveError(error));
     return task;
   }
 
@@ -2261,7 +2274,7 @@
   // a question note is a conversation about its passage: every turn asked there, and a field to ask the next
   const selectedBranches = new Map();
   function turnsOf(n) {
-    if (!n.messages) return n.thread || (n.ask ? [n.ask] : []);
+    if (!n.messages || !selectedBranches.has(n.id)) return n.thread || (n.ask ? [n.ask] : []);
     const by = new Map(n.messages.map((m) => [m.id, m]));
     const parents = new Set(n.messages.map((m) => m.parent));
     const heads = n.messages.map((m) => m.id).filter((id) => !parents.has(id)).sort();
@@ -2418,7 +2431,51 @@
   // a question goes to the model with the turns before it; the note keeps the question at once, the answer fills it in.
   // Stopped (its words wrong, say), the turns before it are as they were and the question is in the field again.
   const asking = new Map();   // a note's id -> the question under way: {req, ctl, q, before}
+  async function askLocalNote(n, q) {
+    if (!D.app) {   // a page made to share has no model behind it: the question stays on screen, with how to ask for real
+      const shown = { ...n, kind: 'ask', thread: [...turnsOf(n).filter((x) => x.a || x.demo), { q, demo: true }] };
+      if (whole(n.anchor)) { chatNote = shown; openChat(shown); } else openNote(shown, true);
+      return;
+    }
+    if (asking.has(n.id)) return;
+    const done = turnsOf(n).filter((x) => x.a), qlang = (turnsOf(n).find((x) => x.lang) || {}).lang || lang;
+    const note = { ...n, kind: 'ask', thread: [...done, { q, a: '', pending: true, lang: qlang }] };
+    delete note.ask;
+    const mine = { req: noteId(), ctl: new AbortController(), q, before: notes.find((x) => x.id === n.id) || null };
+    asking.set(n.id, mine);
+    try { await saveNote(note); } catch { /* shown already; the answer below will report it */ }
+    if (popNote && popNote.id === n.id) openNote(note);
+    if (chatNote && chatNote.id === n.id) openChat(note);
+    let answered;
+    try { answered = await post('/api/ask', { paper: D.meta.id, id: note.id, question: q, ui: readerLang, req: mine.req }, mine.ctl.signal); }
+    catch (err) {
+      if (mine.ctl.signal.aborted || err.message === 'stopped') return;   // (stopAsk put it all back)
+      answered = { ...note, thread: [...done, { q, a: '', lang: qlang, error: String(err.message || err).slice(0, 200) }] };
+    } finally { if (asking.get(n.id) === mine) asking.delete(n.id); }
+    notes = notes.filter((x) => x.id !== answered.id).concat([answered]);
+    acknowledged.set(answered.id, answered);
+    indexNotes();
+    notesChanged([keyOf(answered.anchor)]);
+    if (popNote && popNote.id === answered.id) openNote(answered);
+    if (chatNote && chatNote.id === answered.id) openChat(answered);
+  }
+
+  function stopLocalAsk(n) {
+    const a = asking.get(n.id);
+    if (!a) return;
+    asking.delete(n.id);
+    a.ctl.abort();
+    post('/api/ask/stop', { req: a.req }).catch(() => {});
+    const field = whole(n.anchor) ? chat.querySelector('.ch-input') : npop.querySelector('.np-input');
+    const back = field && field.value.trim() ? field.value : a.q;
+    // the conversation as it was before the question; a first question, stopped, leaves no note (only the field again)
+    const was = a.before && turnsOf(a.before).filter((x) => x.a).length ? { ...a.before, thread: turnsOf(a.before).filter((x) => x.a) } : null;
+    if (was) { delete was.ask; saveNote(was); } else deleteNote(n);
+    const fresh = was || { id: noteId(), kind: 'ask', anchor: n.anchor, text: '', thread: [] };
+    if (whole(n.anchor)) { chatNote = was; openChat(was, back); } else openNote(fresh, !was, back);
+  }
   async function askNote(n, q) {
+    if (!D.cloudSync) return askLocalNote(n, q);
     if (!D.app) {   // a page made to share has no model behind it: the question stays on screen, with how to ask for real
       const shown = { ...n, kind: 'ask', thread: [...turnsOf(n).filter((x) => x.a || x.demo), { q, demo: true }] };
       delete shown.messages;
@@ -2430,7 +2487,7 @@
     const done = turnsOf(n).filter((x) => x.a), qlang = (done.find((x) => x.lang) || {}).lang || lang;
     const parent = done.at(-1)?.message_id || null;
     const nodes = n.messages || [];
-    const note = { ...n, kind: 'ask', messages: [...nodes,
+    const note = { ...n, kind: 'ask', thread: [...done, { q, a: '', pending: true, lang: qlang }], messages: [...nodes,
       { id: mine.req + '-q', parent, role: 'user', text: q, pending: true },
       { id: mine.req + '-a', parent: mine.req + '-q', role: 'assistant', text: '', pending: true, lang: qlang }] };
     delete note.ask;
@@ -2446,7 +2503,7 @@
     }
     catch (err) {
       if (mine.ctl.signal.aborted || err.message === 'stopped') return;   // (stopAsk put it all back)
-      answered = { ...note, messages: note.messages.map((m) => m.id.startsWith(mine.req + '-') ? { ...m, pending: false, error: String(err.message || err).slice(0, 200) } : m) };
+      answered = { ...note, thread: note.thread.map((turn, i) => i === note.thread.length - 1 ? { ...turn, pending: false, error: String(err.message || err).slice(0, 200) } : turn), messages: note.messages.map((m) => m.id.startsWith(mine.req + '-') ? { ...m, pending: false, error: String(err.message || err).slice(0, 200) } : m) };
       try { answered = await saveNote(answered) || answered; } catch { /* saveNote already reports the failed local write */ }
     } finally { if (asking.get(n.id) === mine) asking.delete(n.id); }
     notes = notes.filter((x) => x.id !== answered.id).concat([answered]);
@@ -2458,6 +2515,7 @@
   }
 
   async function stopAsk(n) {
+    if (!D.cloudSync) return stopLocalAsk(n);
     const a = asking.get(n.id);
     if (!a) return;
     asking.delete(n.id);

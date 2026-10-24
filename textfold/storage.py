@@ -109,12 +109,15 @@ class LocalDirectoryBackend:
 
     def get(self, document_id):
         with self._lock:
-            entries = self._entries(document_id)
-            if not entries:
-                raise FileNotFoundError(document_id)
-            raw = self._read_legacy(self._path(document_id))
-            entries = self._entries(document_id)
-            return LegacyLayout.decode(document_id, raw, revision=self._revision(entries), entries=entries)
+            for attempt in range(4):
+                before = self._revision(self._entries(document_id))
+                if before is None:
+                    raise FileNotFoundError(document_id)
+                raw = self._read_legacy(self._path(document_id))
+                entries = self._entries(document_id)
+                if before == self._revision(entries):
+                    return LegacyLayout.decode(document_id, raw, revision=before, entries=entries)
+            raise ConflictError(f"Document changed while reading: {document_id}")
 
     @classmethod
     def _folder_info(cls, folder, identity):
@@ -143,33 +146,21 @@ class LocalDirectoryBackend:
             if document.revision != self._revision(entries):
                 raise ConflictError(f"Document changed: {document.id}")
             folder = self._path(document.id)
-            old = LegacyLayout.read_folder(folder)
-            if raw != old:
-                folder.parent.mkdir(parents=True, exist_ok=True)
-                stage = Path(tempfile.mkdtemp(prefix=".document-", dir=folder.parent))
-                ready, backup = stage / "ready", stage / "backup"
-                published = False
-                try:
-                    if folder.exists():
-                        shutil.copytree(folder, ready, symlinks=True)
-                    LegacyLayout.write_folder(ready, raw)
-                    journal = {"format": "textfold/document-save", "id": document.id,
-                               "pid": os.getpid(), "new": not folder.exists(), "digest": self._fingerprint(raw)}
-                    DirectoryFiles(stage).write("transaction.json", json.dumps(journal).encode("utf-8"))
-                    if folder.exists():
-                        rename_directory(folder, backup)
-                    rename_directory(ready, folder)
-                    published = True
-                finally:
-                    # This also runs for KeyboardInterrupt/SystemExit. A failed
-                    # rollback must leave the only original copy on disk.
-                    if not published and backup.exists() and not folder.exists():
-                        try:
-                            rename_directory(backup, folder)
-                        except BaseException:
-                            pass
-                    if published or not backup.exists():
-                        shutil.rmtree(stage, ignore_errors=True)
+            # A matching revision makes the detached codec snapshot a valid
+            # base. Reuse unchanged bytes; only changed files reach the disk.
+            old = document._legacy if document._legacy else LegacyLayout.read_folder(folder)
+            files = DirectoryFiles(folder)
+            for key in old.keys() - raw.keys():
+                path = files.path(key)
+                path.unlink(missing_ok=True)
+                parent = path.parent
+                while parent != folder:
+                    try: parent.rmdir()
+                    except OSError: break
+                    parent = parent.parent
+            for key, value in raw.items():
+                if old.get(key) != value:
+                    files.write(key, value)
             document.revision = self._revision(self._entries(document.id))
             document._legacy = dict(raw)
             info = LegacyLayout.decode(document.id, {}, entries=self._entries(document.id))
@@ -342,6 +333,8 @@ class DocumentStore:
 
     # Compatibility for old importers only. Plugins don't implement these.
     def has(self, identity, name="meta.json"):
+        if isinstance(self.backend, LocalDirectoryBackend) and identity not in self._active():
+            return DirectoryFiles(self.backend._path(identity)).exists(name)
         try:
             doc = self.get(identity)
         except FileNotFoundError:
@@ -349,6 +342,8 @@ class DocumentStore:
         return checked_key(name) in LegacyLayout.encode(doc)
 
     def read_asset(self, identity, name):
+        if isinstance(self.backend, LocalDirectoryBackend) and identity not in self._active():
+            return DirectoryFiles(self.backend._path(identity)).read(name)
         raw = LegacyLayout.encode(self.get(identity))
         try:
             return raw[checked_key(name)]
@@ -356,6 +351,10 @@ class DocumentStore:
             raise FileNotFoundError(name) from None
 
     def write_asset(self, identity, name, data):
+        if isinstance(self.backend, LocalDirectoryBackend) and identity not in self._active():
+            with self.backend._lock:
+                DirectoryFiles(self.backend.root / 'papers' / checked_id(identity)).write(checked_key(name), data)
+            return
         with self.edit(identity, create=True) as doc:
             raw = LegacyLayout.encode(doc)
             raw[checked_key(name)] = data
@@ -394,6 +393,11 @@ class DocumentStore:
         checked_id(identity)
         if identity in self._active():
             yield self._active()[identity].folder
+            return
+        if isinstance(self.backend, LocalDirectoryBackend) and write:
+            # Local generators write each paid reply to its durable folder as
+            # it arrives. SIGTERM does not need a finally/checkpoint to save it.
+            yield self.backend._path(identity)
             return
         try:
             base = self.backend.get(identity)

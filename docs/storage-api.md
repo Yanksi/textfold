@@ -118,6 +118,8 @@ for a later reconnection. `POST /api/storage/cloud/test` tests the supplied
 connection without saving it. The local server's existing host/origin protections
 apply to all these routes.
 
+For pip/source installs, enable this optional feature with `pip install "textfold[cloud]"`.
+
 Python keyring chooses the system backend. On Linux, install/unlock an available
 Secret Service/KWallet backend as appropriate. See the
 [keyring documentation](https://keyring.readthedocs.io/en/latest/).

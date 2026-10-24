@@ -32,11 +32,15 @@ test('legacy bootstrap retains unchanged records and fences old writers after v2
   const id = 'md-legacy', document = { format: 'textfold/document-v1', id, meta: { id, title: 'Legacy' },
     source: { html: 'Legacy source', markdown: '# Legacy', xml: null, wiki_html: null, pdf: null, reference: null, originals: {} },
     processing: { layout: null, structured: null, replies: {} }, layers: { en: { keep: true } }, images: {}, extensions: {}, legacy: {}, notes: null, previous: null, created: 0, updated: 0 };
+  document.notes = { notes: [{ id: 'n-legacy', anchor: {}, thread: [{ q: 'First', a: 'Old reply' }, { q: 'Added by old pip', a: 'Paid reply' }],
+    messages: [{ id: 'legacy-q', parent: null, role: 'user', text: 'First' }, { id: 'legacy-a', parent: 'legacy-q', role: 'assistant', text: 'Old reply' }] }] };
   const old = await ok('v1/documents/' + id, 'PUT', { document, revision: null, commit: randomUUID() });
   const migrated = await ok('v2/documents/' + id, 'PUT', payload([change('meta', { ...document.meta, title: 'Renamed' })], old.revision));
   const stored = await ok('v2/documents/' + id);
   assert.equal(stored.records['source/markdown'], '# Legacy');
   assert.deepEqual(stored.records['layers/en'], { keep: true });
+  assert.equal(Object.keys(stored.records).filter(k => k.startsWith('message/n-legacy/')).length, 4);
+  assert.ok(Object.values(stored.records).some(v => v && typeof v === 'object' && v.text === 'Paid reply'));
   assert.equal((await call('v1/documents/' + id, 'PUT', { document, revision: migrated.revision, commit: randomUUID() })).status, 409);
   // Simulate an old Worker request that passed its HTTP check before activation.
   // The database itself must fence a late legacy publication on another ID.

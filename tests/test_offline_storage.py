@@ -1,5 +1,6 @@
 """Offline persistence and record merge behavior, always in disposable libraries."""
 import copy
+import json
 import os
 import tempfile
 import unittest
@@ -452,6 +453,18 @@ class OfflineDevices(unittest.TestCase):
         with mock.patch.object(self.a.remote, 'sync_health', side_effect=StorageError('offline')):
             with self.assertRaises(StorageError):
                 self.a.get(self.identity)
+
+    def test_id_histories_from_two_offline_devices_keep_both_sides(self):
+        self.doc.extensions['ids.json'] = json.dumps({'format':'textfold/ids','version':1,'units':{'old':{'section':'s1'}},'sections':{}}).encode()
+        self.seed()
+        for device, identity in ((self.a,'phone'), (self.b,'laptop')):
+            doc = device.get(self.identity)
+            history = json.loads(doc.extensions['ids.json']); history['units'][identity] = {'section':identity}
+            doc.extensions['ids.json'] = json.dumps(history).encode(); device.save(doc)
+        self.sync(self.a); self.sync(self.b); self.sync(self.a)
+        for device in (self.a,self.b):
+            self.assertEqual(set(json.loads(device.get(self.identity).extensions['ids.json'])['units']), {'old','phone','laptop'})
+            self.assertEqual(device.status()['conflicts'], 0)
 
     def test_conversation_forks_survive_two_device_merge(self):
         self.doc.notes['notes'][0].update(kind='ask', thread=[{'q': 'First?', 'a': 'Answer'}])

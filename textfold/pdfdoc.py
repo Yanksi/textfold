@@ -39,11 +39,6 @@ def pid_of(data, ext="pdf"):
     return ("pdf-" if ext == "pdf" else "doc-") + hashlib.sha256(data).hexdigest()[:16]
 
 
-def source_of(pid):
-    """The file a converted document was read from, kept beside it (a PDF as source.pdf, another as original.docx,
-    original.epub, ...: source.html is the document's own), or None."""
-    d = store.pdir(pid)
-    return d / "source.pdf" if (d / "source.pdf").exists() else next(iter(sorted(d.glob("original.*"))), None)
 
 
 def source_name(pid):

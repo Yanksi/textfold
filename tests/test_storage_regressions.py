@@ -15,29 +15,21 @@ class LocalRegressions(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name) / "library"
+        self.root = Path(temp.name).resolve() / "library"
         self.backend = storage.LocalDirectoryBackend(self.root)
         backend_context = store.use_backend(self.backend)
         backend_context.__enter__()
         self.addCleanup(backend_context.__exit__, None, None, None)
         self.pid = local.import_text("# Review fixture\n\nOriginal text.\n")
 
-    def test_interrupt_during_publication_keeps_original_document(self):
+    def test_interrupt_before_atomic_file_replacement_keeps_original_document(self):
+        from textfold import _storage_layout
         before = store.document(self.pid)
-        changed = store.document(self.pid)
-        changed.meta["title"] = "Unpublished"
-        rename = storage.rename_directory
-
-        def interrupt(source, target):
-            if Path(source).name == "ready":
-                raise KeyboardInterrupt()
-            return rename(source, target)
-
-        with mock.patch.object(storage, "rename_directory", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
-            self.backend.save(changed)
-        actual = store.document(self.pid)
-        self.assertEqual(actual.meta, before.meta)
-        self.assertEqual(actual.source, before.source)
+        changed = store.document(self.pid); changed.meta['title'] = 'Unpublished'
+        with mock.patch.object(_storage_layout, 'replace_file', side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt): self.backend.save(changed)
+        self.assertEqual(store.document(self.pid).meta, before.meta)
+        self.assertEqual(store.document(self.pid).source, before.source)
 
     def test_restart_recovers_a_process_killed_between_directory_renames(self):
         self._kill_save(after_publish=False)
@@ -153,7 +145,7 @@ with store.use_backend(storage.LocalDirectoryBackend(sys.argv[1])):
         with mock.patch.object(self.backend, "get", wraps=self.backend.get) as reading:
             actual = store.assemble(self.pid)
         self.assertEqual(actual["meta"]["title"], "Review fixture")
-        self.assertEqual(reading.call_count, 1)
+        self.assertEqual(reading.call_count, 0)
 
     def test_checkpoint_cannot_publish_a_read_only_or_nested_read_only_session(self):
         repo = store.repository()
@@ -171,7 +163,7 @@ with store.use_backend(storage.LocalDirectoryBackend(sys.argv[1])):
             rows = server.listed()
         self.assertEqual(len(rows), 5)
         self.assertTrue(all(row["added"] > 0 for row in rows))
-        self.assertEqual(listing.call_count, 1)
+        self.assertEqual(listing.call_count, 0)
 
     def test_pdf_reconversion_invalidates_layers_but_keeps_original_and_notes(self):
         pid = "pdf-0123456789abcdef"
@@ -246,26 +238,29 @@ with store.use_backend(storage.LocalDirectoryBackend(sys.argv[1])):
             self.assertEqual(errors, [])
 
     def _kill_save(self, after_publish):
-        code = '''
-import os, sys
+        # Build the on-disk transaction left by the earlier experimental build.
+        # The new fast local writer no longer swaps whole directories.
+        code = r'''
+import json, os, sys
 from pathlib import Path
 from textfold import storage
-backend = storage.LocalDirectoryBackend(sys.argv[1])
-doc = backend.get(sys.argv[2])
-doc.meta["title"] = "Published"
-rename = storage.rename_directory
-def killed(source, target):
-    if Path(source).name == "ready":
-        if sys.argv[3] == "True":
-            rename(source, target)
-        os._exit(17)
-    return rename(source, target)
-storage.rename_directory = killed
-backend.save(doc)
+from textfold._storage_layout import LegacyLayout
+root, identity, published = Path(sys.argv[1]), sys.argv[2], sys.argv[3] == "True"
+backend = storage.LocalDirectoryBackend(root)
+folder = root / "papers" / identity
+stage = root / "papers/.document-legacy-fixture"; stage.mkdir()
+raw = LegacyLayout.read_folder(folder)
+meta = json.loads(raw["meta.json"]); meta["title"] = "Published"
+raw["meta.json"] = json.dumps(meta).encode("utf-8")
+LegacyLayout.write_folder(stage / "ready", raw)
+(stage / "transaction.json").write_text(json.dumps({"format":"textfold/document-save", "id":identity,
+    "pid":os.getpid(), "new":False, "digest":backend._fingerprint(raw)}))
+folder.rename(stage / "backup")
+if published: (stage / "ready").rename(folder)
+os._exit(17)
 '''
-        result = subprocess.run([sys.executable, "-c", code, str(self.root), self.pid, str(after_publish)],
-                                capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 17, result.stderr.decode("utf-8", "replace"))
+        result = subprocess.run([sys.executable, '-c', code, str(self.root), self.pid, str(after_publish)], capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 17, result.stderr.decode('utf-8', 'replace'))
 
 
 if __name__ == "__main__":

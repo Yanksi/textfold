@@ -250,8 +250,6 @@ def _file(lib, att):
 
 # ── which item became which document ──────────────────────────────────
 
-def _links_file():
-    return store.DATA / "zotero.json"
 
 
 def links():

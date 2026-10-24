@@ -18,18 +18,33 @@ def digest(value):
     return hashlib.sha256(canonical(value).encode("utf-8")).hexdigest()
 
 
-def messages(note):
-    """Upgrade old linear turns deterministically, without changing old IDs."""
-    if isinstance(note.get("messages"), list):
-        return copy.deepcopy(note["messages"])
-    result, parent = [], None
-    for turn in note.get("thread") or ([note["ask"]] if note.get("ask") else []):
-        identity = "m-" + digest([note.get("id"), parent, turn])[:32]
-        question = {"id": identity + "-q", "parent": parent, "role": "user", "text": turn.get("q", "")}
-        answer = {**turn, "id": identity + "-a", "parent": question["id"], "role": "assistant", "text": turn.get("a", "")}
-        result.extend([question, answer])
+def _message_history(note):
+    nodes = copy.deepcopy(note.get("messages", []))
+    if "thread" not in note and not note.get("ask"):
+        return nodes, None
+    turns = note["thread"] if "thread" in note else [note["ask"]]
+    parent = None
+    for turn in turns:
+        clean = {k: v for k, v in turn.items() if k not in ("message_id", "id", "parent", "role", "text")}
+        questions = {n["id"] for n in nodes if n.get("role") == "user" and n.get("parent") == parent and n.get("text") == clean.get("q", "")}
+        candidates = [n for n in nodes if n.get("role") == "assistant" and n.get("parent") in questions
+                      and n.get("text") == clean.get("a", "") and all(n.get(k) == v for k, v in clean.items() if k not in ("q", "a"))]
+        known = next((n for n in candidates if n["id"] == turn.get("message_id")), None) or next(iter(sorted(candidates, key=lambda n: n["id"])), None)
+        if known:
+            parent = known["id"]
+            continue
+        identity = "m-" + digest([note.get("id"), parent, clean])[:32]
+        question = {"id": identity + "-q", "parent": parent, "role": "user", "text": clean.get("q", "")}
+        answer = {**clean, "id": identity + "-a", "parent": question["id"], "role": "assistant", "text": clean.get("a", "")}
+        for node in (question, answer):
+            if not any(n["id"] == node["id"] for n in nodes): nodes.append(node)
         parent = answer["id"]
-    return result
+    return nodes, parent
+
+
+def messages(note):
+    """The documented thread is canonical; extra branch history stays beside it."""
+    return _message_history(note)[0]
 
 
 def branches(note):
@@ -53,6 +68,8 @@ def branches(note):
 
 
 def conversation(note, head=None):
+    if head is None and "thread" in note:
+        return copy.deepcopy(note["thread"])
     nodes = {m["id"]: m for m in messages(note)}
     heads = branches(note)
     if head is not None and head not in nodes:
@@ -76,6 +93,25 @@ def conversation(note, head=None):
     return turns
 
 
+def last_answer(note):
+    """The canonical thread's latest completed answer, including legacy turns."""
+    nodes, identity = _message_history(note)
+    by = {n["id"]: n for n in nodes}
+    if "thread" not in note and not note.get("ask"):
+        heads = branches(note)
+        identity = heads[-1] if heads else None
+    seen = set()
+    while identity:
+        if identity in seen or identity not in by:
+            raise ValueError("Invalid conversation ancestry")
+        seen.add(identity)
+        node = by[identity]
+        if node.get("role") == "assistant" and node.get("text") and not node.get("pending"):
+            return identity
+        identity = node.get("parent")
+    return None
+
+
 def split(manifest):
     """A record's identifier is local to a document, never a physical filename."""
     records = {"meta": copy.deepcopy(manifest["meta"])}
@@ -96,7 +132,10 @@ def split(manifest):
         for index, note in enumerate(notes.get("notes", [])):
             identity = note.get("id") or "legacy-" + digest([index, note])[:32]
             records["annotation/" + identity] = {k: copy.deepcopy(v) for k, v in note.items() if k not in ("thread", "ask", "messages", "branches")}
-            for node in messages({**note, "id": identity}):
+            nodes, head = _message_history({**note, "id": identity})
+            if "thread" in note or note.get("ask"):
+                records["annotation/" + identity]["thread_head"] = head
+            for node in nodes:
                 records[f"message/{identity}/{node['id']}"] = node
         for conflict in notes.get("conflicts", []):
             records["conflict/" + conflict["id"]] = copy.deepcopy(conflict)
@@ -130,7 +169,10 @@ def join(identity, records, created=0, updated=0):
                 if nodes:
                     note["messages"] = nodes
                     note["branches"] = branches(note)
-                    note["thread"] = conversation(note)
+                    if "thread_head" in note:
+                        note["thread"] = conversation({"messages": nodes}, note["thread_head"]) if note["thread_head"] else []
+                    else:
+                        note["thread"] = conversation(note)
                 notes["notes"].append(note)
             elif key.startswith("conflict/"):
                 notes["conflicts"].append(copy.deepcopy(records[key]))
@@ -192,7 +234,9 @@ def reconcile(base, local, remote):
                 bv, lv, rv = (v.get(field, _ABSENT) for v in (b, l, r))
                 if lv == bv or lv == rv:
                     continue
-                if rv == bv or field in ("updated", "created"):
+                if field == "thread_head":
+                    merged[field] = max((v for v in (lv, rv) if isinstance(v, str)), default=None)
+                elif rv == bv or field in ("updated", "created"):
                     if lv is _ABSENT:
                         merged.pop(field, None)
                     else:
@@ -411,3 +455,9 @@ def library_value(values, revision=None):
     positions = {identity: i for i, identity in enumerate(ordering)}
     zotero = dict(sorted(zotero.items(), key=lambda item: (positions.get(item[0], len(ordering)), item[0])))
     return LibraryState(catalog, zotero, revision)
+
+
+def note_records(identity, notes):
+    """Split notes without depending on a transport or its blob codec."""
+    return split({"meta": None, "source": {}, "processing": {}, "layers": {}, "images": {},
+                  "extensions": {}, "legacy": {}, "previous": None, "notes": notes})

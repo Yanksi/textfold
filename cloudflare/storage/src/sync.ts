@@ -21,19 +21,23 @@ async function hash(value: Json): Promise<string> {
   return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function legacyMessages(note: ObjectValue): Promise<ObjectValue[]> {
-  if (Array.isArray(note.messages)) return note.messages.map(object);
-  const turns = Array.isArray(note.thread) ? note.thread : note.ask ? [note.ask] : [];
-  const nodes: ObjectValue[] = [];
+async function messageHistory(note: ObjectValue): Promise<{ nodes: ObjectValue[]; head: string | null }> {
+  const nodes: ObjectValue[] = Array.isArray(note.messages) ? note.messages.map(raw => ({ ...object(raw) })) : [];
+  const all = Array.isArray(note.thread) ? note.thread : note.ask ? [note.ask] : [];
   let parent: string | null = null;
-  for (const raw of turns) {
-    const turn = object(raw);
-    const id: string = "m-" + (await hash([note.id ?? null, parent, turn])).slice(0, 32);
-    nodes.push({ id: id + "-q", parent, role: "user", text: turn.q ?? "" });
-    nodes.push({ ...turn, id: id + "-a", parent: id + "-q", role: "assistant", text: turn.a ?? "" });
-    parent = id + "-a";
+  for (const raw of all) {
+    const turn = object(raw), clean = Object.fromEntries(Object.entries(turn).filter(([key]) => !["message_id", "id", "parent", "role", "text"].includes(key)));
+    const questions = new Set(nodes.filter(n => n.role === "user" && n.parent === parent && n.text === (clean.q ?? "")).map(n => n.id));
+    const candidates = nodes.filter(n => n.role === "assistant" && questions.has(n.parent) && n.text === (clean.a ?? "") && Object.entries(clean).every(([key, value]) => ["q", "a"].includes(key) || canonical(n[key] ?? null) === canonical(value)));
+    const known = candidates.find(n => n.id === turn.message_id) ?? candidates.sort((a, b) => String(a.id).localeCompare(String(b.id)))[0];
+    if (known) { parent = String(known.id); continue; }
+    const id: string = "m-" + (await hash([note.id ?? null, parent, clean])).slice(0, 32);
+    const question: ObjectValue = { id: id + "-q", parent, role: "user", text: clean.q ?? "" };
+    const answer: ObjectValue = { ...clean, id: id + "-a", parent: question.id, role: "assistant", text: clean.a ?? "" };
+    for (const node of [question, answer]) if (!nodes.some(n => n.id === node.id)) nodes.push(node);
+    parent = String(answer.id);
   }
-  return nodes;
+  return { nodes, head: parent };
 }
 
 export async function split(doc: ObjectValue): Promise<ObjectValue> {
@@ -55,7 +59,9 @@ export async function split(doc: ObjectValue): Promise<ObjectValue> {
     for (let i = 0; i < all.length; i++) {
       const note = object(all[i]), id = typeof note.id === "string" ? note.id : "legacy-" + (await hash([i, note])).slice(0, 32);
       result[`annotation/${id}`] = Object.fromEntries(Object.entries(note).filter(([key]) => !["thread", "ask", "messages", "branches"].includes(key)));
-      for (const node of await legacyMessages({ ...note, id })) result[`message/${id}/${node.id}`] = node;
+      const history = await messageHistory({ ...note, id });
+      if (own(note, "thread") || note.ask) object(result[`annotation/${id}`]).thread_head = history.head;
+      for (const node of history.nodes) result[`message/${id}/${node.id}`] = node;
     }
     if (Array.isArray(notes.conflicts)) for (const raw of notes.conflicts) { const item = object(raw); result[`conflict/${item.id}`] = item; }
     if (notes.aliases) for (const [id, value] of Object.entries(object(notes.aliases))) result[`alias/${id}`] = value;
@@ -63,12 +69,12 @@ export async function split(doc: ObjectValue): Promise<ObjectValue> {
   return result;
 }
 
-function turns(nodes: ObjectValue[]): { heads: string[]; thread: Json[] } {
+function turns(nodes: ObjectValue[], selected?: string | null): { heads: string[]; thread: Json[] } {
   const by = new Map(nodes.map(node => [String(node.id), node]));
   const parents = new Set(nodes.map(node => node.parent));
   const heads = [...by.keys()].filter(key => !parents.has(key)).sort();
   const path: ObjectValue[] = [], seen = new Set<string>();
-  let id: string | null = heads.at(-1) ?? null;
+  let id: string | null = selected === undefined ? heads.at(-1) ?? null : selected;
   while (id) {
     if (seen.has(id) || !by.has(id)) throw new Failure(400, "Invalid conversation ancestry");
     seen.add(id);
@@ -113,7 +119,7 @@ export function join(id: string, values: ObjectValue, created: number, updated: 
       if (key.startsWith("annotation/")) {
         const note = { ...object(values[key]) }, prefix = "message/" + key.slice(11) + "/";
         const nodes = Object.keys(values).sort().filter(k => k.startsWith(prefix)).map(k => object(values[k]));
-        if (nodes.length) { const tree = turns(nodes); Object.assign(note, { messages: nodes, branches: tree.heads, thread: tree.thread }); }
+        if (nodes.length) { const tree = turns(nodes, own(note, "thread_head") ? note.thread_head as string | null : undefined); Object.assign(note, { messages: nodes, branches: tree.heads, thread: tree.thread }); }
         (notes.notes as Json[]).push(note);
       } else if (key.startsWith("conflict/")) (notes.conflicts as Json[]).push(values[key]);
       else if (key.startsWith("alias/")) put(object(notes.aliases), key.slice(6), values[key]);

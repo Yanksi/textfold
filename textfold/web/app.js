@@ -1474,7 +1474,7 @@
     const tests = {};         // the last connection test of each model: the levels' (gen), the questions' (ask)
     let bridgeStarting = false, bridgeState = null;
     const dlg = h('dialog', 'settings prefs'); document.body.append(dlg);
-    let storageDraft = null, storageBusy = false, storageError = '';
+    let storageDraft = null, storageMode = null, storageBusy = false, storageError = '';
     let cloudDraft = null, cloudBusy = false, cloudError = '', cloudTested = false;
     let syncState = null, syncError = '', conflicts = [], conflictCount = -1;
     dlg.addEventListener('close', () => { settingsOpen = false; });
@@ -1496,6 +1496,7 @@
           <label for="st-cache-path">${esc(t.sync_cache)}<div class="st-storage-path"><input id="st-cache-path" type="text" spellcheck="false" autocomplete="off" value="${esc(d.cache_path)}" placeholder="${esc(t.sync_cache_default)}"${disabled}>
           ${window.desktop?.chooseLibraryFolder ? `<button type="button" class="st-btn st-cache-pick"${disabled}>${esc(t.storage_choose)}</button>` : ''}</div></label>
           <p class="st-note">${esc(t.sync_cloud_explain)}</p>` : `
+          <label>${esc(t.storage_action)}<select class="st-storage-mode"${disabled}><option value="copy"${(storageMode ?? s.mode) === 'existing' ? '' : ' selected'}>${esc(t.storage_copy)}</option><option value="existing"${(storageMode ?? s.mode) === 'existing' ? ' selected' : ''}>${esc(t.storage_existing)}</option></select></label>
           <div class="st-storage-current"><span class="st-meta">${esc(t.storage_current)}</span><code>${esc(s.path)}</code></div>
           <label for="st-storage-path">${esc(t.storage_destination)}<div class="st-storage-path"><input id="st-storage-path" class="st-storage-input" type="text" spellcheck="false" autocomplete="off" value="${esc(storageDraft ?? (s.pending || s.path))}"${disabled}>
           ${window.desktop?.chooseLibraryFolder ? `<button type="button" class="st-btn st-storage-pick"${disabled}>${esc(t.storage_choose)}</button>` : ''}</div></label>
@@ -1731,6 +1732,7 @@
       }; });
     }
     async function refreshSync(force = false) {
+      if (data.cloudStorage?.active !== 'cloud') return;
       if (!dlg.isConnected) return;
       try {
         syncState = await api('/api/storage/sync');
@@ -1765,6 +1767,7 @@
       }
       const cloudMode = q('#st-cloud-mode');
       if (cloudMode) cloudMode.onchange = () => { cloudDraft.enabled = cloudMode.value === 'cloud'; render(); };
+      const storageSelect = q('.st-storage-mode'); if (storageSelect) storageSelect.onchange = () => { storageMode = storageSelect.value; };
       const storageInput = q('.st-storage-input');
       if (storageInput) storageInput.oninput = () => { storageDraft = storageInput.value; };
       for (const [selector, key] of [['.st-storage-pick', 'local'], ['.st-cache-pick', 'cache']]) {
@@ -1787,7 +1790,7 @@
             if (data.cloudStorage?.enabled) data.cloudStorage = await api('/api/storage/cloud', { enabled: false });
             const local = data.storage?.local || data.storage;
             if (cancel || (storageDraft && storageDraft !== (local.pending || local.path))) {
-              data.storage = await api('/api/storage', cancel ? { cancel: true } : { path: storageDraft });
+              data.storage = await api('/api/storage', cancel ? { cancel: true } : { path: storageDraft, mode: storageMode ?? local.mode });
               const saved = data.storage.local || data.storage;
               storageDraft = saved.pending || saved.path;
             }
@@ -1936,7 +1939,7 @@
     pollStorage();
   });
   async function pollStorage() {
-    if (syncPolling || document.hidden) return;
+    if (!BOOT.cloudSync || syncPolling || document.hidden) return;
     syncPolling = true;
     try {
       const s = await api('/api/storage/sync');
@@ -1959,10 +1962,10 @@
     } catch { /* the local app may be restarting */ }
     finally { syncPolling = false; }
   }
-  const resumeStorage = (reason) => { api('/api/storage/sync', { action: 'sync', reason }).catch(() => {}); pollStorage(); };
+  const resumeStorage = (reason) => { if (!BOOT.cloudSync) return; api('/api/storage/sync', { action: 'sync', reason }).catch(() => {}); pollStorage(); };
   addEventListener('online', () => resumeStorage('online')); addEventListener('focus', () => resumeStorage('focus'));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeStorage('focus'); });
-  setInterval(pollStorage, 10000); pollStorage();
+  if (BOOT.cloudSync) { setInterval(pollStorage, 10000); pollStorage(); }
 
   renderSidebar();
   if (landing) refreshModels().then((d) => {

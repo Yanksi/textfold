@@ -148,10 +148,12 @@ A paragraph or section still there, edited, moved or renamed, keeps its id (`ids
 ## Conversation graphs and retained revisions
 
 New notes can include `messages: [{id, parent, role, text, ...}]` and `branches`
-(leaf message IDs). `thread` is a compatibility projection of one branch; it must
-not be used to reconstruct or overwrite a stored graph. All messages remain in
-JSON/document exports even when the UI is viewing one branch. Legacy linear
-threads convert deterministically when exposed to the new reader or sync layer.
+(leaf message IDs). `thread` remains the canonical, editable conversation for
+interoperability with older clients. New or edited thread-only turns are
+incorporated into the graph deterministically; existing sidecar branches remain
+in JSON/document exports. The optional `thread_head` selects its canonical
+branch (null for an empty thread) without erasing archived sibling branches.
+Local-only readers retain the established linear editing and turn-deletion UI.
 Confirmed messages are immutable; concurrent replies preserve separate children.
 
 The root can contain `conflicts` and `aliases`. A conflict keeps its merge base,

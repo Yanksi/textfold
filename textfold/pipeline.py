@@ -45,7 +45,7 @@ def generate(ref, lang, cfg, force=False, jobs=4, progress=lambda *a: None, log=
             d = store.pdir(pid)
         else:
             try:
-                fetch(pid, store.DATA)
+                fetch(pid, store.library_root() if store.is_local() else store.DATA)
                 d = store.pdir(pid)
             except urllib.error.HTTPError as e:
                 if e.code == 404:

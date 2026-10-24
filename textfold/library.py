@@ -31,7 +31,7 @@ _lock = threading.Lock()
 
 
 def path():
-    return store.DATA / "library.json"
+    return store.library_root() / "library.json"
 
 
 def _times(d, key):
@@ -44,6 +44,28 @@ class _Catalog(dict):
 
 
 def load():
+    if store.is_local():
+        try:
+            d = json.loads(store.read_text(path()))
+        except (OSError, ValueError):
+            d = {}
+        folders = [{"id": f["id"], "name": f["name"], **({"parent": f["parent"]} if isinstance(f.get("parent"), str) else {})}
+                   for f in d.get("folders") or []
+                   if isinstance(f, dict) and isinstance(f.get("id"), str) and isinstance(f.get("name"), str)]
+        ids = {f["id"] for f in folders}
+        by = {f["id"]: f for f in folders}
+        for f in folders:   # a parent that is gone, or a folder under itself (a loop, edited by hand): at the top
+            seen, p = {f["id"]}, f.get("parent")
+            while p in by and p not in seen:
+                seen.add(p)
+                p = by[p].get("parent")
+            if f.get("parent") not in ids or p in seen:
+                f.pop("parent", None)
+        of = d.get("of") if isinstance(d.get("of"), dict) else {}
+        names = d.get("names") if isinstance(d.get("names"), dict) else {}
+        return {"folders": folders, "of": {p: f for p, f in of.items() if f in ids and store.valid_id(p)},
+                "names": {p: n for p, n in names.items() if store.valid_id(p) and isinstance(n, str) and n.strip()},
+                "added": _times(d, "added"), "opened": _times(d, "opened")}
     try:
         state = store.repository().library()
         d = state.catalog
@@ -71,6 +93,12 @@ def load():
 
 
 def _save(d):
+    if store.is_local():
+        f = path()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f.name + ".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(f)
     base = getattr(d, "state", None) or store.repository().library()
     local = copy.deepcopy(base)
     local.catalog.update(d)
@@ -200,6 +228,17 @@ def _papers(pids):
 
 
 def stamp(papers, index=None):
+    if store.is_local():
+        """The documents of the list (store.papers), each with when it came in ("added") and when it was last opened
+        ("opened", or None), and the name the reader gave it, if any; one listed for the first time is dated here and kept."""
+        with _lock:
+            d = load()
+            new = {p["id"]: _came_in(p["id"]) for p in papers if p["id"] not in d["added"]}
+            if new:
+                d["added"].update(new)
+                _save(d)
+        return [{**p, "added": d["added"][p["id"]], "opened": d["opened"].get(p["id"]),
+                 **({"name": d["names"][p["id"]]} if p["id"] in d["names"] else {})} for p in papers]
     """The documents of the list (store.papers), each with when it came in ("added") and when it was last opened
     ("opened", or None), and the name the reader gave it, if any; one listed for the first time is dated here and kept."""
     with _lock:
@@ -247,3 +286,11 @@ def remember(pid, kept):
             if k in kept and ok(kept[k]):
                 d[k][pid] = kept[k]
         _save(d)
+
+
+def _came_in(pid):
+    """When a document came in, from its folder: its oldest file, or the folder itself when that is older."""
+    d = store.pdir(pid)
+    st = d.stat()
+    times = [f.stat().st_mtime for f in d.rglob("*") if f.is_file()]
+    return min(times + [getattr(st, "st_birthtime", st.st_mtime)])

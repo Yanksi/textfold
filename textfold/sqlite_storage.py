@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .cloud_storage import _pack, _unpack
+from .document_wire import pack as _pack, unpack as _unpack
 from .documents import ConflictError, DocumentInfo
 from .storage import document_info
 from ._storage_layout import checked_id
@@ -186,6 +186,49 @@ class SQLiteBackend:
                 raise ValueError("Original source is immutable; import changed content as a new document")
             self._blobs(blobs)
             document.revision, document.created, document.updated = self.write(db, document.id, value, dirty=True, created=document.created)
+
+    def reconcile(self, base, local, remote):
+        """Merge IDs individually; conflict variants retain all unrelated history."""
+        key = "extensions/ids.json"
+        b, l, r = (mapping.get(key) for mapping in (base, local, remote))
+        if not (b and l and r and l != b and r != b and l != r):
+            return records.reconcile(base, local, remote)
+        try:
+            values = [json.loads(self._download(ref["sha256"], ref["size"]).decode("utf-8")) for ref in (b, l, r)]
+            if any(not isinstance(v, dict) or v.get("format", "textfold/ids") != "textfold/ids" or
+                   any(not isinstance(v.get(group, {}), dict) for group in ("units", "sections")) for v in values):
+                return records.reconcile(base, local, remote)
+        except (OSError, ValueError, KeyError, TypeError):
+            return records.reconcile(base, local, remote)
+        absent = object()
+        def flatten(value):
+            out = {(group, identity): item for group in ("units", "sections") for identity, item in value.get(group, {}).items()}
+            out.update({("header", name): item for name, item in value.items() if name not in ("units", "sections")})
+            return out
+        before, left, right = map(flatten, values)
+        merged_left, merged_right = {}, {}
+        for identity in before.keys() | left.keys() | right.keys():
+            bv, lv, rv = (v.get(identity, absent) for v in (before, left, right))
+            if lv == bv: lv = rv
+            elif rv == bv: rv = lv
+            if lv is not absent: merged_left[identity] = lv
+            if rv is not absent: merged_right[identity] = rv
+        def reference(items):
+            value = {"units": {}, "sections": {}}
+            for (group, identity), item in items.items():
+                if group == "header": value[identity] = item
+                else: value[group][identity] = item
+            raw = records.canonical(value).encode("utf-8")
+            digest = hashlib.sha256(raw).hexdigest()
+            self._blobs({digest: raw})
+            return {"sha256": digest, "size": len(raw)}
+        lref, rref = reference(merged_left), reference(merged_right)
+        local, remote, base = dict(local), dict(remote), dict(base)
+        local[key], remote[key] = lref, rref
+        # _legacy is only lossless byte-format information; the extension is
+        # authoritative. Avoid a second opaque conflict for the same history.
+        for mapping in (base, local, remote): mapping.pop("legacy/ids.json", None)
+        return records.reconcile(base, local, remote)
 
     def _state(self, identity, state, placement=None):
         self._identity(identity)

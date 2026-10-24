@@ -199,7 +199,7 @@ class OfflineBackend:
             merged = values
             if row and pending:
                 base = json.loads(captured["local_records"]) if captured else json.loads(row["remote_records"])
-                merged, _ = records.reconcile(base, current, values)
+                merged, _ = self.cache.reconcile(base, current, values)
                 if captured:
                     if row["state"] != captured["local_state"] or (payload and json.loads(row["placement"]) != payload["placement"]):
                         state, placement = row["state"], json.loads(row["placement"])
@@ -272,14 +272,16 @@ class OfflineBackend:
                     db.execute("DELETE FROM pending_requests WHERE document_id=?", (identity,))
         for _ in range(4):
             snapshot = self._snapshot(identity)
+            ids_blobs = self._bytes({k: v for k, v in snapshot["records"].items() if k in ("extensions/ids.json", "legacy/ids.json")})
             with self.cache.transaction() as db:
+                self.cache._blobs(ids_blobs)
                 row = db.execute("SELECT * FROM documents WHERE id=?", (identity,)).fetchone()
                 pending = db.execute("SELECT * FROM pending_changes WHERE document_id=?", (identity,)).fetchone()
                 if not row or not pending:
                     return
                 local = self.cache.values(db, identity)
                 base = json.loads(row["remote_records"])
-                merged, _ = records.reconcile(base, local, snapshot["records"])
+                merged, _ = self.cache.reconcile(base, local, snapshot["records"])
                 state, placement = row["state"], json.loads(row["placement"])
                 remote_state = snapshot["state"]
                 if snapshot["revision"] is None and row["remote_revision"] is not None:

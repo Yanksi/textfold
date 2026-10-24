@@ -45,6 +45,9 @@ class Library(unittest.TestCase):
         self.assertEqual(json.loads(library.path().read_text(encoding="utf-8"))["folders"][1]["name"], "Group")
 
     def test_stale_view_does_not_erase_a_concurrently_added_folder(self):
+        from textfold.sqlite_storage import SQLiteBackend
+        context = store.use_backend(SQLiteBackend(store.DATA / "cloud-workspace"))
+        context.__enter__(); self.addCleanup(context.__exit__, None, None, None)
         a, b = library.load(), library.load()
         a['folders'].append({'id': 'f-laptop', 'name': 'Laptop'})
         b['folders'].append({'id': 'f-phone', 'name': 'Phone'})

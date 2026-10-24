@@ -21,7 +21,7 @@ def _keyring():
             raise RuntimeError("No keyring backend")
         return backend
     except Exception:
-        raise OSError("System keyring is unavailable; install/unlock a supported keyring backend") from None
+        raise OSError("System keyring is unavailable; install textfold[cloud] and unlock a supported keyring backend") from None
 
 
 def _password(config):

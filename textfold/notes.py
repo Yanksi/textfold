@@ -16,8 +16,7 @@ from collections import Counter
 from . import kinds, langs, llm, store
 from .tokens import plain
 from . import sync_records
-from .documents import ConflictError, Document
-from .cloud_storage import _pack
+from .documents import ConflictError
 
 FORMAT, VERSION = "textfold/notes", 1   # (files written under earlier names say "paperfold/notes" or "dynamic-reader/notes")
 _LOCK = threading.RLock()   # merge an answer and save its note under the same lock
@@ -50,11 +49,55 @@ def kind(n):
     return "ask" if n.get("kind") == "ask" else "note" if (n.get("text") or "").strip() else "hl"
 
 
+def _local_read(pid):
+    f = _file(pid)
+    if f.exists():
+        return {**json.loads(store.read_text(f)), "format": FORMAT}   # (an older file's name for the same format, renewed)
+    meta = json.loads(store.read_text(store.pdir(pid) / "meta.json"))
+    return {"format": FORMAT, "version": VERSION,
+            "paper": {"id": pid, "version": meta.get("version", ""), "title": meta.get("title", ""), "url": meta.get("abs_url", "")},
+            "notes": []}
+
+
+def _local__write(pid, data):
+    f = _file(pid)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(f)
+
+
+def _local_put(pid, note):
+    """Add a note, or replace the one with its id. The server stamps the times."""
+    if not isinstance(note, dict) or not str(note.get("id", "")).startswith("n-") or not isinstance(note.get("anchor"), dict):
+        raise ValueError("bad note")
+    with _LOCK:
+        data = read(pid)
+        old = next((n for n in data["notes"] if n["id"] == note["id"]), None)
+        for field in ("messages", "branches"):
+            if old and field not in note and field in old:
+                note[field] = copy.deepcopy(old[field])
+        note["created"] = (old or {}).get("created") or note.get("created") or now()
+        note["updated"] = now()
+        data["notes"] = [n for n in data["notes"] if n["id"] != note["id"]] + [note]
+        _write(pid, data)
+    return data
+
+
+def _local_delete(pid, nid):
+    with _LOCK:
+        data = read(pid)
+        data["notes"] = [n for n in data["notes"] if n["id"] != nid]
+        _write(pid, data)
+    return data
+
+
 class _Notes(dict):
     """A read snapshot carries its merge base in memory, never in JSON exports."""
 
 
 def read(pid):
+    if store.is_local():
+        return _local_read(pid)
     document = store.document(pid)
     if document.notes is not None:
         data = _Notes({**document.notes, "format": FORMAT})
@@ -68,6 +111,8 @@ def read(pid):
 
 
 def _write(pid, data):
+    if store.is_local():
+        return _local__write(pid, data)
     base = getattr(data, "base_notes", None)
     for attempt in range(4):
         document = store.document(pid)
@@ -89,11 +134,13 @@ def _write(pid, data):
 
 
 def _records(pid, value):
-    all_records = sync_records.split(_pack(Document(pid, notes=value))[0])
+    all_records = sync_records.note_records(pid, value)
     return {k: v for k, v in all_records.items() if k == "notes" or k.startswith(("annotation/", "message/", "conflict/", "alias/"))}
 
 
 def conflicts():
+    if store.is_local():
+        return []
     return [{"document": info.id, "title": info.meta.get("title", ""), **c} for info in store.repository().list()
             for c in (store.document(info.id).notes or {}).get("conflicts", [])]
 
@@ -118,6 +165,11 @@ def _body(note):
 def present(data):
     """Read tokens for browser edits; never persist them into notes exports."""
     result = copy.deepcopy(data)
+    if store.is_local():
+        for note in result["notes"]:
+            note.pop("messages", None)
+            note.pop("branches", None)
+        return result
     for note in result["notes"]:
         note["_base"] = _body(note)
         note["_revision"] = sync_records.digest(note["_base"])
@@ -129,6 +181,8 @@ def present(data):
 
 
 def put(pid, note):
+    if store.is_local():
+        return _local_put(pid, note)
     """Add a note, or replace the one with its id. The server stamps the times."""
     if not isinstance(note, dict) or not str(note.get("id", "")).startswith("n-") or not isinstance(note.get("anchor"), dict):
         raise ValueError("bad note")
@@ -181,6 +235,8 @@ def put(pid, note):
 
 
 def delete(pid, nid, base=None):
+    if store.is_local():
+        return _local_delete(pid, nid)
     with _LOCK:
         data = read(pid)
         old = next((n for n in data["notes"] if n["id"] == nid), None)
@@ -201,7 +257,9 @@ ASK_SCHEMA = {"type": "object", "properties": {
 
 def turns(note, head=None):
     """A question note's conversation: thread (from v0.9), or the single ask of the first notes."""
-    return sync_records.conversation(note, head) if "messages" in note else note.get("thread") or ([note["ask"]] if note.get("ask") else [])
+    if head is not None:
+        return sync_records.conversation(note, head)
+    return note["thread"] if "thread" in note else ([note["ask"]] if note.get("ask") else sync_records.conversation(note))
 
 
 def _text(u, atoms, lang):
@@ -397,7 +455,42 @@ def _cited(answer, nums, units):
     return answer, cites
 
 
+def _local_ask(pid, nid, question, spec, timeout=300, ui=None, req=None):
+    """Answer a question in note nid's conversation with the model, add the turn to the note, and return the note.
+    Stopped meanwhile (stop, by req): Stopped, and the note as it is."""
+    doc = store.assemble(pid)
+    with _LOCK:
+        note = next((n for n in read(pid)["notes"] if n["id"] == nid), None)
+    if not note:
+        raise ValueError("no such note")
+    done = [t for t in turns(note) if t.get("a")]   # answered turns (a pending or failed one is being asked again)
+    lang = next((t.get("lang") for t in turns(note) if t.get("lang")), None) or note["anchor"].get("lang") or "en"
+    text, nums = prompt(doc, note, question, lang, done[-6:], ui if ui in langs.LANGS else None)
+    rec, _ = llm.call(text, ASK_SCHEMA, spec, store.pdir(pid) / "llm-cache", timeout=timeout, system=kinds.adapt(SYSTEM_ASK, doc["meta"]))
+    out = rec["out"]
+    answer, cites = _cited(out["answer"], nums, doc["units"])
+    held = []   # the citations kept aside while an id written out in full (not as a citation) becomes its section
+    bare = CITE.sub(lambda m: held.append(m.group(0)) or f"\ue000{len(held) - 1}\ue001", answer)
+    bare, more = _ids_out(bare, [], doc)
+    answer = re.sub("\ue000(\\d+)\ue001", lambda m: held[int(m.group(1))], bare)
+    cites += [c for c in more if c not in cites]
+    nxt = [re.sub(r"\s+", " ", CITE.sub("", q)).strip() for q in (out.get("next") or []) if isinstance(q, str)]
+    note["thread"] = done + [{"q": question, "a": answer, "takeaway": CITE.sub("", out["takeaway"]).strip(),
+                              "cites": cites, "next": [q for q in nxt if q][:2],
+                              "model": spec["id"], "lang": lang, "at": now()}]
+    note.pop("ask", None)
+    note["kind"] = "ask"
+    with _STOP_LOCK:   # (a stop and the answer crossing: the one second knows of the other)
+        if req and req in _STOPPED:
+            _STOPPED.discard(req)
+            raise Stopped(req)
+        put(pid, note)
+    return note
+
+
 def ask(pid, nid, question, spec, timeout=300, ui=None, req=None, parent=None):
+    if store.is_local():
+        return _local_ask(pid, nid, question, spec, timeout, ui, req)
     token = (pid, nid, req or uuid.uuid4().hex)
     with _LOCK:
         if token in _INFLIGHT:
@@ -435,8 +528,7 @@ def _ask(pid, nid, question, spec, timeout=300, ui=None, req=None, parent=None):
             raise ValueError("Question request ID was reused")
         parent = existing_question.get("parent")
     elif parent is None:
-        answered = [m for m in nodes if m.get("role") == "assistant" and m.get("text") and not m.get("pending")]
-        parent = answered[-1]["id"] if answered else None
+        parent = sync_records.last_answer(note)
     if parent is not None and not any(m["id"] == parent for m in nodes):
         raise ValueError("Unknown conversation parent")
     done = [t for t in sync_records.conversation({"messages": nodes}, parent) if t.get("a")] if parent else []
@@ -484,7 +576,7 @@ def cancel_question(pid, nid, req):
             return
         ids = {req + "-q", req + "-a"}
         note["messages"] = [m for m in sync_records.messages(note) if m["id"] not in ids or not m.get("pending")]
-        note["thread"] = sync_records.conversation(note)
+        note["thread"] = sync_records.conversation({"messages": note["messages"]})
         _write(pid, data)
 
 
@@ -498,7 +590,7 @@ def reanchor(pid, old, new):
     where it was: on the edited paragraph it was on if that is still there, else on its section's title, so that the
     reader lists and shows it; the next replace looks for it again. A conversation's citations follow the paragraphs."""
     with _LOCK:
-        if store.document(pid).notes is None:
+        if (store.is_local() and not _file(pid).exists()) or (not store.is_local() and store.document(pid).notes is None):
             return None
         data = read(pid)
         moves = Moves(old, new)

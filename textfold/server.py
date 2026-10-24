@@ -507,10 +507,23 @@ def assembled(pid, only=None):
     gone = ids.load(pid)   # (a link to a paragraph or section no longer in the text opens where it went)
     if gone["units"] or gone["sections"]:
         doc["gone"] = gone
+    doc["cloudSync"] = not store.is_local()
     return doc
 
 
 def reader_page(pid):
+    if store.is_local():
+        layers = store.pdir(pid) / "layers"
+        sig = tuple(sorted((f.name, f.stat().st_mtime) for f in layers.glob("*.json"))) if layers.exists() else ()
+        sig += ((build.WEB / "template.html").stat().st_mtime, library.name_of(pid))  # a changed page template, or name, re-renders too
+        gone = store.pdir(pid) / ids.FILE
+        sig += (gone.stat().st_mtime_ns if gone.exists() else 0,)
+        sig += tuple((name, (build.WEB / name).stat().st_mtime_ns) for name in STATIC)
+        hit = PAGES.get(pid)
+        if not hit or hit[0] != sig:
+            hit = (sig, build.page(assembled(pid), app=True))
+            PAGES[pid] = hit
+        return hit[1]
     repo = store.repository()
     sig = (repo.cache_token,) + repo.revision(pid)
     sig += ((build.WEB / "template.html").stat().st_mtime, library.name_of(pid))  # a changed page template, or name, re-renders too
@@ -523,6 +536,15 @@ def reader_page(pid):
 
 
 def listed():
+    if store.is_local():
+        """The papers for the list: those on disk, with when each came in and was last opened, and the citekey of each one
+        read from a Zotero item that has one."""
+        rows = library.stamp(store.papers())
+        keys = zotero.citekeys()
+        for p in rows:
+            if keys.get(p["id"]):
+                p["citekey"] = keys[p["id"]]
+        return rows
     """The papers for the list: those on disk, with when each came in and was last opened, and the citekey of each one
     read from a Zotero item that has one."""
     index = store.repository().list()
@@ -547,7 +569,7 @@ def landing_page(jobs):
         # The settings page must remain usable when a cloud service/keyring is
         # unavailable. This is an explicit error state, never a local fallback.
         papers, folders, storage_error = [], {"folders": []}, str(error)
-    boot = {"papers": papers, "folders": folders, "storageError": storage_error, "jobs": jobs.list(), "model": data["selectedName"] or "",
+    boot = {"cloudSync": not store.is_local(), "papers": papers, "folders": folders, "storageError": storage_error, "jobs": jobs.list(), "model": data["selectedName"] or "",
             "askName": data["askName"], "modelData": data,
             "bridge": data["bridge"], "langs": langs.natives()}
     t = build.app_assets((build.WEB / "app.html").read_text(encoding="utf-8"))
@@ -760,7 +782,7 @@ def make_handler(jobs):
                             backend.request_sync(reason if reason in ('manual', 'online', 'focus') else 'manual')
                         elif action in ("import", "download"):
                             from .storage_settings import active_path
-                            backend.background(action, store.LocalDirectoryBackend(active_path(store.DATA, store.HOME)) if action == "import" else None)
+                            backend.background(action, store.LocalDirectoryBackend(active_path(store.DATA, store.DATA)) if action == "import" else None)
                         elif action == "clear":
                             return self.json(backend.clear_cache())
                         elif action == "resolve":
@@ -781,7 +803,7 @@ def make_handler(jobs):
                         return self.json({"error": str(error)}, 400)
                 if u.path == "/api/storage":
                     try:
-                        return self.json(store.schedule_storage(body.get("path"), bool(body.get("cancel"))))
+                        return self.json(store.schedule_storage(body.get("path"), bool(body.get("cancel")), body.get("mode", "copy")))
                     except (ValueError, OSError) as e:
                         return self.json({"error": str(e)}, 400)
                 s = models.load_settings()
@@ -847,13 +869,25 @@ def make_handler(jobs):
                     text, name = str(body.get("text") or ""), str(body.get("name") or "document.md")[:200]
                     if not text.strip():
                         return self.json({"error": "empty"}, 400)
-                    if body.get("id"):
+                    if body.get("id") and not store.is_local():
                         return self.json({"error": "Original source is immutable; import changed content as a new document"}, 409)
+                    if body.get("id"):   # an edited text in place of the one stored (a note folded again where it is written)
+                        pid = str(body["id"])
+                        if any(j["pid"] == pid and j["status"] in ("queued", "running") for j in jobs.list()):
+                            return self.json({"error": "busy"}, 409)
+                        try:
+                            title = local.replace_text(pid, text, name if body.get("name") else None)
+                        except LookupError:
+                            return self.json({"error": "no such document"}, 404)
+                        except ValueError:
+                            return self.json({"error": "not-markdown"}, 400)
+                        PAGES.pop(pid, None)
+                        return self.json({"paper": pid, "title": title, "replaced": True})
                     try:
                         pid = local.import_text(text, name)
                     except ValueError:
                         return self.json({"error": "not-markdown"}, 400)
-                    return self.json({"paper": pid, "title": store.document(pid).meta["title"]})
+                    return self.json({"paper": pid, "title": json.loads(store.text(pid, "meta.json"))["title"]})
                 if u.path == "/api/export":   # the paper as one file, saved by the reader for themself
                     pid, lang = str(body.get("paper") or ""), str(body.get("lang") or "en")
                     if not store.valid_id(pid) or not store.has(pid):

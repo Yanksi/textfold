@@ -1,7 +1,7 @@
 # Document storage
 
-The storage plugin interface is **document-oriented**. Document ID is the
-primary index and the read/save unit. A plugin decides whether a document is a
+The storage backend interface is **document-oriented**. Document ID is the
+primary index and the read/save unit. A backend decides whether a document is a
 folder, a database record, an archive, or several objects in remote storage.
 Callers never supply storage keys, filenames, prefixes, or physical paths.
 
@@ -26,7 +26,7 @@ default, and selecting a cloud service never automatically migrates documents.
 - `created`, `updated`, `revision`: timestamps and an opaque concurrency token.
 
 `_legacy` is private round-trip information used by the built-in codec to retain
-old JSON formatting/encodings and unchanged bytes. Plugins do not interpret it.
+old JSON formatting/encodings and unchanged bytes. Backends do not interpret it.
 The domain fields, rather than `_legacy`, determine the saved document.
 
 `DocumentInfo` is a lightweight index row: ID, metadata, translated titles,
@@ -102,16 +102,16 @@ The outermost workspace controls whether it is writable; nested calls cannot
 promote a read-only workspace, and its checkpoints never publish changes.
 Uploaded originals are deleted from temporary uploads only after a durable
 checkpoint has committed them to the document backend.
-Plugins **do not implement** `workspace`, file IO, directory scans or synchronization
+Backends **do not implement** `workspace`, file IO, directory scans or synchronization
 of temporary directories. `store.pdir`, `asset` and filename-based helpers remain
-compatibility details for these integrations, not the plugin interface.
+compatibility details for these integrations, not the backend interface.
 
 `tests/test_storage.py` runs the same semantic operations against disk and a
 memory adapter storing complete Document objects, with no file/path methods.
 It tests originals, notes, layers, PDF parsing, generation, replacement, trash,
 stale-write rejection and interrupted parser processing.
 
-Automatic plugin discovery remains future work. Settings supports local storage
+Backend selection is explicit. Settings supports local storage
 and any HTTPS service implementing the versioned [Storage API](storage-api.md).
 
 ## Local compatibility
@@ -236,4 +236,4 @@ unresolved conflicts cancel the switch and keep the previous workspace active;
 the Settings error explains why. No document data is moved or removed.
 
 See the [approved design](storage-offline-sync-design.md) for merging and
-retention rules. SQL schemas are internal adapter details, not plugin interfaces.
+retention rules. SQL schemas are internal adapter details, not backend interfaces.

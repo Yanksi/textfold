@@ -19,7 +19,7 @@ from textfold._storage_layout import DirectoryFiles
 
 
 class MemoryBackend:
-    """A plugin with only document values: no file keys, paths, or workspaces."""
+    """A backend with only document values: no file keys, paths, or workspaces."""
     name = "memory"
 
     def __init__(self):

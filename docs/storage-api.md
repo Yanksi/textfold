@@ -1,7 +1,7 @@
 # TextFold Storage API
 
 This is the wire protocol used by the generic Python `CloudStorageBackend`.
-The application-facing plugin interface remains whole-document
+The application-facing backend interface remains whole-document
 [`StorageBackend`](storage.md). Clients do not inspect a server's physical file
 layout. The [D1/R2 Worker](../cloudflare/storage/) is one implementation.
 

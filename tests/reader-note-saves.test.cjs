@@ -69,14 +69,17 @@ test('background synchronization leaves a failed visible draft available for ret
   const h = reader(async () => { throw new Error('Temporary local HTTP failure'); });
   await assert.rejects(h.context.saveNote({ ...h.original, text: 'Unsent draft' }));
   const source = fs.readFileSync(path.join(__dirname, '../textfold/web/reader.js'), 'utf8');
-  let refresh;
+  let refresh, scheduled;
   Object.assign(h.context, {
     document: { addEventListener(name, callback) { refresh = callback; } },
-    asking: new Map(), chat: { hidden: true },
+    asking: new Map(), chat: { hidden: true }, busy: false, stage: null, tr: null, holding: false, drag: null, rafId: 0,
+    setTimeout(callback) { scheduled = callback; return 1; },
+    clearTimeout() {},
     fetch() { assert.fail('Background refresh must not overwrite the unsaved draft'); },
   });
-  vm.runInContext(source.slice(source.indexOf("  document.addEventListener('tf-storage-synced'"), source.indexOf('  function saveNote(n)')), h.context);
+  vm.runInContext(source.slice(source.indexOf('  let notesRefreshPending'), source.indexOf('  function saveNote(n)')), h.context);
   await refresh();
+  await scheduled();
   assert.equal(h.context.notes[0].text, 'Unsent draft');
 });
 

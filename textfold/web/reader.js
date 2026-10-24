@@ -1981,18 +1981,59 @@
     if (notesOf.size) notesChanged([...notesOf.keys()]); else updateNotesBtn();
     openFromHash();
   }
-  document.addEventListener('tf-storage-synced', async () => {
-    // Leave a draft under the cursor alone. It carries its own base revision and
-    // will be reconciled by the server when saved.
-    if (noteSaves.size || failedNoteFields.size || asking.size || popNote || !chat.hidden) return;
+  let notesRefreshPending = false, notesRefreshTimer = 0, notesRefreshRunning = false, notesRefreshFailures = 0;
+  function queueNotesRefresh(delay = 250) {
+    if (!notesRefreshTimer && !notesRefreshRunning) notesRefreshTimer = setTimeout(refreshSyncedNotes, delay);
+  }
+  function notesRefreshBlocked() {
+    // A remote refresh must not replace an animation's DOM or a draft under the cursor.
+    return document.hidden || busy || stage || tr || holding || drag || rafId ||
+      noteSaves.size || failedNoteFields.size || asking.size || popNote || !chat.hidden;
+  }
+  function noteAppearance(list) {
+    return JSON.stringify(list, (key, value) => {
+      if (key === '_base' || key === '_revision') return undefined;
+      return value && typeof value === 'object' && !Array.isArray(value)
+        ? Object.fromEntries(Object.keys(value).sort().map((k) => [k, value[k]])) : value;
+    });
+  }
+  async function refreshSyncedNotes() {
+    notesRefreshTimer = 0;
+    if (!notesRefreshPending || notesRefreshRunning) return;
+    if (notesRefreshBlocked()) { queueNotesRefresh(busy || stage || tr || holding || drag || rafId ? 250 : 2000); return; }
+    notesRefreshRunning = true; notesRefreshPending = false;
+    const requestedNotes = notes;
     try {
       const response = await fetch(`/api/notes/${D.meta.id}`);
-      if (!response.ok) return;
-      const data = await response.json(), affected = [...notesOf.keys()];
+      if (!response.ok) throw new Error('Could not refresh notes');
+      const data = await response.json();
+      notesRefreshFailures = 0;
+      // Editing or another sync may have begun while HTTP was in flight. Read
+      // again after it settles rather than publishing this older snapshot.
+      if (notesRefreshBlocked() || notesRefreshPending || notes !== requestedNotes) { notesRefreshPending = true; return; }
+      const before = new Map([...notesOf].map(([uid, list]) => [uid, noteAppearance(list)]));
       notes = data.notes || []; noteAliases = data.aliases || {}; acknowledged.clear();
       for (const n of notes) acknowledged.set(n.id, n);
-      indexNotes(); notesChanged([...affected, ...notesOf.keys()]);
-    } catch { /* cached reading continues */ }
+      indexNotes();
+      const affected = [...new Set([...before.keys(), ...notesOf.keys()])]
+        .filter((uid) => before.get(uid) !== (notesOf.has(uid) ? noteAppearance(notesOf.get(uid)) : undefined));
+      // Library changes and revision acknowledgements leave the prepared zoom
+      // frames intact; only passages whose notes changed need new frames.
+      if (affected.length) notesChanged(affected);
+    } catch {   // Keep the last hint through a transient local HTTP failure; cached reading continues.
+      notesRefreshPending = true;
+      notesRefreshFailures = Math.min(6, notesRefreshFailures + 1);
+    }
+    finally {
+      notesRefreshRunning = false;
+      if (notesRefreshPending) queueNotesRefresh(notesRefreshFailures ? Math.min(30000, 1000 * 2 ** (notesRefreshFailures - 1)) : 250);
+    }
+  }
+  document.addEventListener('tf-storage-synced', () => {
+    notesRefreshPending = true;
+    notesRefreshFailures = 0;
+    clearTimeout(notesRefreshTimer); notesRefreshTimer = 0;
+    queueNotesRefresh();
   });
   function saveNote(n) {   // shown at once; written in the background (the promise, for whoever must wait for it)
     const before = notes.find((x) => x.id === n.id);
@@ -2044,7 +2085,11 @@
       failedNoteFields.delete(n.id); acknowledged.delete(n.id);
       return data;
     });
-    task.catch((error) => saveError(error));
+    noteSaves.set(n.id, task);
+    task.then(() => { if (noteSaves.get(n.id) === task) noteSaves.delete(n.id); }, (error) => {
+      if (noteSaves.get(n.id) === task) noteSaves.delete(n.id);
+      saveError(error);
+    });
     return task;
   }
 

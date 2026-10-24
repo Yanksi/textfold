@@ -1789,8 +1789,8 @@
             // Validate switching first: an unsynced cloud workspace must remain selected.
             if (data.cloudStorage?.enabled) data.cloudStorage = await api('/api/storage/cloud', { enabled: false });
             const local = data.storage?.local || data.storage;
-            if (cancel || (storageDraft && storageDraft !== (local.pending || local.path))) {
-              data.storage = await api('/api/storage', cancel ? { cancel: true } : { path: storageDraft, mode: storageMode ?? local.mode });
+            if (cancel || (storageDraft && storageDraft !== (local.pending || local.path)) || (storageMode && storageMode !== local.mode)) {
+              data.storage = await api('/api/storage', cancel ? { cancel: true } : { path: storageDraft ?? (local.pending || local.path), mode: storageMode ?? local.mode });
               const saved = data.storage.local || data.storage;
               storageDraft = saved.pending || saved.path;
             }

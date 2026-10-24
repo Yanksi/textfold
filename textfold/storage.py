@@ -447,5 +447,5 @@ class DocumentStore:
         if identity in self._active():
             return self._active()[identity].folder
         if isinstance(self.backend, LocalDirectoryBackend):
-            return self.backend._path(identity)
+            return self.backend.root / "papers" / identity
         raise RuntimeError("A local document path requires a document workspace")

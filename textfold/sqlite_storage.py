@@ -191,11 +191,11 @@ class SQLiteBackend:
         """Merge IDs individually; conflict variants retain all unrelated history."""
         key = "extensions/ids.json"
         b, l, r = (mapping.get(key) for mapping in (base, local, remote))
-        if not (b and l and r and l != b and r != b and l != r):
+        if not (l != b and r != b and l != r):
             return records.reconcile(base, local, remote)
         try:
-            values = [json.loads(self._download(ref["sha256"], ref["size"]).decode("utf-8")) for ref in (b, l, r)]
-            if any(not isinstance(v, dict) or v.get("format", "textfold/ids") != "textfold/ids" or
+            values = [json.loads(self._download(ref["sha256"], ref["size"]).decode("utf-8")) if ref else {} for ref in (b, l, r)]
+            if any(not isinstance(v, dict) or v.get("format", "textfold/ids") != "textfold/ids" or v.get("version", 1) != 1 or
                    any(not isinstance(v.get(group, {}), dict) for group in ("units", "sections")) for v in values):
                 return records.reconcile(base, local, remote)
         except (OSError, ValueError, KeyError, TypeError):

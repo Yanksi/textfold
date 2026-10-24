@@ -295,7 +295,7 @@ def apply(pid):
         return False
     try:
         data = store.repository().library().zotero
-        meta = store.document(pid).meta
+        meta = json.loads(store.text(pid, "meta.json"))
     except (OSError, ValueError):
         return False
     found = [(where, v) for where, v in data.items() if isinstance(v, dict) and v.get("paper") == pid and v.get("record")]
@@ -310,6 +310,5 @@ def apply(pid):
         meta["abs_url"] = rec.get("url") or f"https://doi.org/{rec['doi']}"
     meta["label"] = f"Zotero · {rec.get('citekey') or (meta.get('source') or {}).get('name') or meta['title']}"
     meta["zotero"] = {"library": lib, "item": key, "citekey": rec.get("citekey", "")}
-    with store.edit(pid) as document:
-        document.meta = meta
+    store.put_asset(pid, "meta.json", json.dumps(meta, ensure_ascii=False, indent=1).encode("utf-8"))
     return True

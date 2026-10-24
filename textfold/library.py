@@ -44,31 +44,13 @@ class _Catalog(dict):
 
 
 def load():
-    if store.is_local():
-        try:
-            d = json.loads(store.read_text(path()))
-        except (OSError, ValueError):
-            d = {}
-        folders = [{"id": f["id"], "name": f["name"], **({"parent": f["parent"]} if isinstance(f.get("parent"), str) else {})}
-                   for f in d.get("folders") or []
-                   if isinstance(f, dict) and isinstance(f.get("id"), str) and isinstance(f.get("name"), str)]
-        ids = {f["id"] for f in folders}
-        by = {f["id"]: f for f in folders}
-        for f in folders:   # a parent that is gone, or a folder under itself (a loop, edited by hand): at the top
-            seen, p = {f["id"]}, f.get("parent")
-            while p in by and p not in seen:
-                seen.add(p)
-                p = by[p].get("parent")
-            if f.get("parent") not in ids or p in seen:
-                f.pop("parent", None)
-        of = d.get("of") if isinstance(d.get("of"), dict) else {}
-        names = d.get("names") if isinstance(d.get("names"), dict) else {}
-        return {"folders": folders, "of": {p: f for p, f in of.items() if f in ids and store.valid_id(p)},
-                "names": {p: n for p, n in names.items() if store.valid_id(p) and isinstance(n, str) and n.strip()},
-                "added": _times(d, "added"), "opened": _times(d, "opened")}
+    native = store.is_local()
     try:
-        state = store.repository().library()
-        d = state.catalog
+        if native:
+            state, d = None, json.loads(store.read_text(path()))
+        else:
+            state = store.repository().library()
+            d = state.catalog
     except (OSError, ValueError):
         state, d = LibraryState(), {}
     folders = [{"id": f["id"], "name": f["name"], **({"parent": f["parent"]} if isinstance(f.get("parent"), str) else {})}
@@ -88,6 +70,8 @@ def load():
     result = _Catalog({"folders": folders, "of": {p: f for p, f in of.items() if f in ids and store.valid_id(p)},
             "names": {p: n for p, n in names.items() if store.valid_id(p) and isinstance(n, str) and n.strip()},
             "added": _times(d, "added"), "opened": _times(d, "opened")})
+    if native:
+        return dict(result)
     result.state = copy.deepcopy(state)
     return result
 
@@ -99,6 +83,7 @@ def _save(d):
         tmp = f.with_name(f.name + ".tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(f)
+        return
     base = getattr(d, "state", None) or store.repository().library()
     local = copy.deepcopy(base)
     local.catalog.update(d)

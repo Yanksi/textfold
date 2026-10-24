@@ -202,6 +202,22 @@ def original_unchanged(before, after):
 _ABSENT = object()
 
 
+def _conversation_head(key, left, right, versions):
+    prefix = "message/" + key.split("/", 1)[1] + "/"
+    nodes = {v["id"]: v for values in versions for k, v in values.items() if k.startswith(prefix)}
+    def follows(child, ancestor):
+        seen = set()
+        while child and child not in seen:
+            if child == ancestor: return True
+            seen.add(child)
+            child = nodes.get(child, {}).get("parent")
+        return False
+    if isinstance(left, str) and isinstance(right, str):
+        if follows(left, right): return left
+        if follows(right, left): return right
+    return max((v for v in (left, right) if isinstance(v, str)), default=None)
+
+
 def reconcile(base, local, remote):
     """Merge independent records/fields; retain ambiguous edits as revisions."""
     result = copy.deepcopy(remote)
@@ -234,13 +250,13 @@ def reconcile(base, local, remote):
                 bv, lv, rv = (v.get(field, _ABSENT) for v in (b, l, r))
                 if lv == bv or lv == rv:
                     continue
-                if field == "thread_head":
-                    merged[field] = max((v for v in (lv, rv) if isinstance(v, str)), default=None)
-                elif rv == bv or field in ("updated", "created"):
+                if rv == bv or field in ("updated", "created"):
                     if lv is _ABSENT:
                         merged.pop(field, None)
                     else:
                         merged[field] = copy.deepcopy(lv)
+                elif field == "thread_head":
+                    merged[field] = _conversation_head(key, lv, rv, (base, local, remote))
                 else:
                     ambiguous.append(field)
             result[key] = merged

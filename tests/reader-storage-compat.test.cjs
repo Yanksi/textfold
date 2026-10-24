@@ -28,3 +28,17 @@ test('all twelve interfaces have localized cloud storage and sync controls', () 
     if(!['en','zh'].includes(code)) assert.notEqual(t.sync_save_failed,api.t('en').sync_save_failed);
   }
 });
+
+test('changing a pending local-library action saves even if its path is unchanged', async () => {
+  const app=fs.readFileSync(path.join(__dirname,'../textfold/web/app.js'),'utf8');
+  const start=app.indexOf('      const saveStorage = async (' ),end=app.indexOf('      const storageSave',start);
+  assert.ok(start>=0 && end>start);
+  const calls=[],scope={storageBusy:false,storageError:'',cloudError:'',cloudTested:false,
+    dlg:{isConnected:true},cloudDraft:{enabled:false},storageDraft:null,storageMode:'existing',render(){},
+    data:{storage:{path:'/old',pending:'/existing',mode:'copy'},cloudStorage:{enabled:false}},
+    api:async(path,body)=>{calls.push({path,body});return{path:'/old',pending:'/existing',mode:body.mode};}};
+  vm.runInNewContext(app.slice(start,end)+';globalThis.save=saveStorage;',scope);
+  await scope.save();
+  assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/storage');
+  assert.equal(calls[0].body.path,'/existing');assert.equal(calls[0].body.mode,'existing');
+});

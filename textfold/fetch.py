@@ -29,6 +29,10 @@ def fetch(pid, root: Path, force=False):
     from . import store
     from .storage import DocumentStore, LocalDirectoryBackend
     repo = store.repository() if Path(root) == Path(store.DATA) else DocumentStore(LocalDirectoryBackend(root))
+    if isinstance(repo.backend, LocalDirectoryBackend):
+        folder = repo.backend.root / "papers" / pid
+        if not force and (folder / "source.html").exists() and (folder / "meta.json").exists():
+            return folder
     with repo.edit(pid, create=True) as document:
         if document.source.html is not None and document.meta is not None and not force:
             return document

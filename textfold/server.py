@@ -265,7 +265,7 @@ class Jobs:
             if job["kind"] == "generate" and stage not in ("queued", "fetch") and store.has(job["pid"]):
                 if not job.get("title"):   # a new paper's title, once it is parsed
                     try:
-                        job["title"] = store.document(job["pid"]).meta["title"]
+                        job["title"] = json.loads(store.text(job["pid"], "meta.json"))["title"]
                     except (OSError, ValueError, KeyError):
                         pass
                 if job.get("attach") and not job.get("attached"):   # the reader's own copy of an online paper's PDF
@@ -336,7 +336,7 @@ class Jobs:
             PAGES.pop(job["pid"], None)
 
     def _pdf_link(self, job, url=None):
-        url = url or store.document(job["pid"]).source.reference.strip()
+        url = url or store.text(job["pid"], "url.txt").strip()
         with urllib.request.urlopen(urllib.request.Request(url, headers=fetch.UA), timeout=90) as r:
             data = r.read(pdf.LIMIT + 1)
         if data[:5] != b"%PDF-" or len(data) > pdf.LIMIT:
@@ -642,7 +642,10 @@ def make_handler(jobs):
                 if m and store.valid_id(m.group(1)):
                     name = m.group(2)
                     kind = IMAGE_TYPES.get(Path(name).suffix.lower())
-                    data = store.document(m.group(1)).images.get(name) if store.has(m.group(1)) else None
+                    try:
+                        data = store.asset(m.group(1), "img/" + name) if store.has(m.group(1)) else None
+                    except FileNotFoundError:
+                        data = None
                     if kind and data is not None:
                         return self.send(200, data, kind, cache="max-age=86400")
                     return self.json({"error": "no such picture"}, 404)
@@ -860,7 +863,7 @@ def make_handler(jobs):
                     src = store.DATA / "uploads" / f"{pid}-again{Path(source).suffix}"
                     src.parent.mkdir(parents=True, exist_ok=True)
                     src.write_bytes(original[1])
-                    name = store.document(pid).meta.get("source", {}).get("name") or "document.pdf"
+                    name = json.loads(store.text(pid, "meta.json")).get("source", {}).get("name") or "document.pdf"
                     return self.json(jobs.convert(pid, src, name, body.get("lang") or "en", tier, replace=True))
                 if u.path == "/api/jobs/stop":
                     job = jobs.stop(body.get("id", ""))

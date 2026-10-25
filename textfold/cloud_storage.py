@@ -19,6 +19,7 @@ from . import __version__
 
 MAX_MANIFEST = 8 * 1024 * 1024
 MAX_BLOB = 100 * 1024 * 1024
+_UNSET = object()
 
 
 from .document_wire import StorageError, pack as _pack, unpack as _unpack
@@ -149,8 +150,10 @@ class CloudStorageBackend:
                 raise StorageError("Invalid sync index pagination")
             cursor = following
 
-    def sync_snapshot(self, document_id):
+    def sync_snapshot(self, document_id, *, base_revision=_UNSET):
         path = "library" if document_id == "@library" else self._path(document_id)
+        if base_revision is not _UNSET:
+            path += "?base_revision=" + urllib.parse.quote(base_revision or "", safe="")
         return self._request("GET", path, version="v2")
 
     def sync_commit(self, document_id, payload):
@@ -235,7 +238,7 @@ class CloudStorageBackend:
         if revision is not None and value["revision"] != revision:
             raise ConflictError("Trash changed; refresh before trying again")
         self.sync_commit(document_id, {"operation_id": str(uuid.uuid4()), "revision": value["revision"],
-                                      "changes": [], "state": "active", "placement": value["placement"]})
+                                      "base_revision": value["revision"], "changes": [], "state": "active", "placement": value["placement"]})
         return value["placement"]
 
     def delete_trashed(self, document_id, revision=None):
@@ -247,7 +250,7 @@ class CloudStorageBackend:
         if revision is not None and value["revision"] != revision:
             raise ConflictError("Trash changed; refresh before trying again")
         result = self.sync_commit(document_id, {"operation_id": str(uuid.uuid4()), "revision": value["revision"],
-                                               "changes": [], "state": "deleted", "placement": {}, "purge": True})
+                                               "base_revision": value["revision"], "changes": [], "state": "deleted", "placement": {}, "purge": True})
         if result.get("purged") is not True:
             raise StorageError("The service did not confirm permanent deletion")
         return True

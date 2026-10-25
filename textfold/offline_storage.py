@@ -51,6 +51,7 @@ class OfflineBackend:
         self._closed = False
         self._cycle_changed = False
         self._sync_enabled = False
+        self._reimport_supported = False
         self._blocked = False
         self._thread = None
         self._online, self._error, self._last_sync = False, "", 0
@@ -185,6 +186,7 @@ class OfflineBackend:
             if health.get('sync_enabled') is not True:
                 db.execute("DELETE FROM sync_state WHERE key='v2_baseline'")
         self._sync_enabled = health.get('sync_enabled') is True
+        self._reimport_supported = health.get('document_reimport') == 1
         self._notifications.configure(health)
         return health
 
@@ -202,20 +204,48 @@ class OfflineBackend:
 
     def _snapshot(self, identity):
         try:
+            if self._reimport_supported and identity != LIBRARY:
+                with self.cache.transaction() as db:
+                    row = db.execute("SELECT remote_revision FROM documents WHERE id=?", (identity,)).fetchone()
+                return self.remote.sync_snapshot(identity, base_revision=row[0] if row else None)
             return self.remote.sync_snapshot(identity)
         except FileNotFoundError:
             return {"records": {}, "revision": None, "state": "active", "placement": {}, "info": {}}
 
+    def _old_base(self, identity, snapshot):
+        """Never merge unsent edits across a permanent deletion/reimport."""
+        if snapshot.get("purged"):
+            return False
+        with self.cache.transaction() as db:
+            row = db.execute("SELECT reimport_revision,purged,purge_base FROM documents WHERE id=?", (identity,)).fetchone()
+            if row and row["reimport_revision"]:
+                return False  # Its durable explicit request must be retried first.
+            if not snapshot.get("base_deleted") and not (row and row["purged"] and not row["purge_base"]):
+                return False
+            pending = db.execute("SELECT 1 FROM pending_changes WHERE document_id=? UNION SELECT 1 FROM pending_requests WHERE document_id=?", (identity, identity)).fetchone()
+        if pending:
+            self._accept_purge(identity, snapshot)
+            return True
+        return False
+
     def _accept(self, identity, snapshot, *, captured=None, payload=None):
         """Install a cloud acknowledgement without clearing edits made in flight."""
         if snapshot.get("purged"):
+            with self.cache.transaction() as db:
+                row = db.execute("SELECT reimport_revision FROM documents WHERE id=?", (identity,)).fetchone()
+            if row and row[0] == snapshot["revision"]:
+                return  # The explicit import has not been published yet.
             self._accept_purge(identity, snapshot, captured=captured)
+            return
+        if not captured and self._old_base(identity, snapshot):
             return
         values = snapshot["records"]
         blobs = self._bytes(values)
         with self.cache.transaction() as db:
             self.cache._blobs(blobs)
             row = db.execute("SELECT * FROM documents WHERE id=?", (identity,)).fetchone()
+            if row and (snapshot.get("base_deleted") or row["purged"]):
+                db.execute("UPDATE documents SET purged=0,purge_base=NULL,created=? WHERE id=?", (snapshot.get("info", {}).get("created", time.time()), identity))
             pending = db.execute("SELECT * FROM pending_changes WHERE document_id=?", (identity,)).fetchone()
             current = self.cache.values(db, identity)
             state, placement = snapshot["state"], snapshot.get("placement", {})
@@ -237,6 +267,8 @@ class OfflineBackend:
                 db.execute("DELETE FROM pending_changes WHERE document_id=?", (identity,))
             if captured:
                 db.execute("DELETE FROM pending_requests WHERE document_id=? AND operation_id=?", (identity, captured["operation_id"]))
+                if payload and payload.get("reimport_from"):
+                    db.execute("UPDATE documents SET reimport_revision=NULL WHERE id=? AND reimport_revision=?", (identity, payload["reimport_from"]))
 
     def _accept_purge(self, identity, snapshot, *, captured=None):
         """A terminal cloud identity can never publish again. Keep unacknowledged
@@ -266,7 +298,7 @@ class OfflineBackend:
                     db.execute("DELETE FROM pending_requests WHERE document_id=? AND operation_id=?", (identity, captured["operation_id"]))
             state = row["state"] if preserve and identity in self._deferred else "deleted"
             db.execute("UPDATE documents SET state=?,purged=1,purge_base=NULL,remote_revision=?,remote_state='deleted',remote_records='{}',loaded=? WHERE id=?",
-                       (state, snapshot["revision"], int(preserve and bool(row and row["loaded"])), identity))
+                       (state, row["remote_revision"] if preserve and not snapshot.get("purged") else snapshot["revision"], int(preserve and bool(row and row["loaded"])), identity))
 
     def _index(self, entries, *, complete=False):
         present = {entry["id"] for entry in entries} if complete else set()
@@ -286,7 +318,7 @@ class OfflineBackend:
                     revision = str(uuid.uuid4())
                     info = {**entry["info"], "revision": revision}
                     db.execute("INSERT INTO documents(id,revision,created,updated,info_json,state,loaded,remote_revision,remote_state) VALUES (?,?,?,?,?,?,0,?,?) "
-                               "ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,updated=excluded.updated,info_json=excluded.info_json,state=excluded.state,remote_revision=excluded.remote_revision,remote_state=excluded.remote_state",
+                               "ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,updated=excluded.updated,info_json=excluded.info_json,state=excluded.state,purged=0,purge_base=NULL,remote_revision=excluded.remote_revision,remote_state=excluded.remote_state",
                                (identity, revision, info.get("created", 0), info.get("updated", 0), records.canonical(info), entry["state"], entry["revision"], entry["state"]))
                     refresh = False
             if refresh:
@@ -330,17 +362,30 @@ class OfflineBackend:
                 return  # A feed acknowledgement may have cleared this cycle's outbox.
             request = db.execute("SELECT * FROM pending_requests WHERE document_id=?", (identity,)).fetchone()
         if request:
+            old_payload = json.loads(request["payload"])
+            if not old_payload.get("reimport_from"):
+                latest = self._snapshot(identity)
+                if self._old_base(identity, latest):
+                    return
             try:
                 self._send(request)
+                self._accept(identity, self._snapshot(identity))
                 return
             except ConflictError:
                 with self.cache.transaction() as db:
                     db.execute("DELETE FROM pending_requests WHERE document_id=?", (identity,))
         for _ in range(4):
             snapshot = self._snapshot(identity)
-            if snapshot.get("purged"):
+            with self.cache.transaction() as db:
+                row = db.execute("SELECT reimport_revision FROM documents WHERE id=?", (identity,)).fetchone()
+            reimport = row[0] if row else None
+            if snapshot.get("purged") and not (reimport and reimport == snapshot["revision"]):
                 self._accept_purge(identity, snapshot)
                 return
+            if not reimport and self._old_base(identity, snapshot):
+                return
+            if reimport and (not snapshot.get("purged") or snapshot["revision"] != reimport):
+                raise ConflictError("The document changed during reimport; local content is retained for recovery")
             with self.cache.transaction() as db:
                 if identity in self._deferred:
                     return
@@ -351,7 +396,7 @@ class OfflineBackend:
                     db.execute("UPDATE documents SET purged=0,purge_base=NULL,state='trash' WHERE id=?", (identity,))
                 elif purge_base and pending:
                     payload = {"operation_id": str(uuid.uuid4()), "revision": purge_base, "changes": [],
-                               "state": "deleted", "placement": {}, "purge": True}
+                               "base_revision": row["remote_revision"], "state": "deleted", "placement": {}, "purge": True}
                     values = self.cache.values(db, identity)
                     db.execute("INSERT OR REPLACE INTO pending_requests VALUES (?,?,?,?,?,?,?)",
                                (identity, payload["operation_id"], records.canonical(payload), records.canonical(values), pending["generation"], "{}", row["state"]))
@@ -383,7 +428,7 @@ class OfflineBackend:
                 remote_state = snapshot["state"]
                 if snapshot["revision"] is None and row["remote_revision"] is not None:
                     raise StorageError("Previously synchronized document disappeared; restore or export local changes before retrying")
-                if row["remote_state"] == "active":
+                if row["remote_state"] == "active" and not reimport:
                     edited = None
                     if remote_state != "active" and state == "active":
                         state, placement = remote_state, snapshot.get("placement", {})
@@ -399,7 +444,9 @@ class OfflineBackend:
                     raise StorageError("Original source differs; import this content as a new document")
                 delta = records.changes(snapshot["records"], merged)
                 payload = {"operation_id": str(uuid.uuid4()), "revision": snapshot["revision"], "changes": delta,
-                           "state": state, "placement": placement, "created": row["created"]}
+                           "base_revision": row["remote_revision"], "state": state, "placement": placement, "created": row["created"]}
+                if reimport:
+                    payload["reimport_from"] = reimport
                 if not delta and state == remote_state and placement == snapshot.get("placement", {}):
                     request = {"local_records": records.canonical(local), "local_state": row["state"], "operation_id": "", "document_id": identity}
                 else:
@@ -500,8 +547,10 @@ class OfflineBackend:
                     # snapshot before upload; advancing the cursor loses no edit.
                     continue
                 snapshot = self._snapshot(identity)
+                if self._old_base(identity, snapshot):
+                    continue
                 if snapshot.get("purged"):
-                    self._accept_purge(identity, snapshot)
+                    self._accept(identity, snapshot)
                     continue
                 if pending:
                     continue
@@ -560,6 +609,29 @@ class OfflineBackend:
             self.cache.save(document)
             if document.id not in self._deferred:
                 self.request_sync()
+
+    def prepare_import(self, identity):
+        self.cache._identity(identity)
+        with self._remote_lock:
+            try:
+                self.get(identity)
+            except FileNotFoundError:
+                pass
+            with self.cache.transaction() as db:
+                row = db.execute("SELECT purged,state FROM documents WHERE id=?", (identity,)).fetchone()
+                protected = db.execute("SELECT 1 FROM pending_changes WHERE document_id=? UNION SELECT 1 FROM pending_requests WHERE document_id=? UNION SELECT 1 FROM records WHERE document_id=? AND record_key LIKE 'conflict/%' AND deleted=0", (identity, identity, identity)).fetchone()
+            if not row or not row["purged"] and row["state"] != "deleted":
+                return
+            if protected or identity in self._deferred:
+                raise ConflictError("Local recovery data are protected; export them before importing this document again")
+            if self._health().get("document_reimport") != 1:
+                raise StorageError("Upgrade the storage service before importing a permanently deleted document again")
+            snapshot = self._snapshot(identity)
+            if not snapshot.get("purged"):
+                self._accept(identity, snapshot)
+                return
+            self._accept_purge(identity, snapshot)
+            self.cache.prepare_import(identity)
 
     def delete(self, identity):
         self.get(identity)
@@ -649,7 +721,7 @@ class OfflineBackend:
 
     def clear_cache(self):
         with self.cache.transaction() as db:
-            rows = db.execute("SELECT id FROM documents WHERE id!=? AND loaded=1 AND id NOT IN (SELECT document_id FROM pending_changes) AND id NOT IN (SELECT document_id FROM pending_requests) AND id NOT IN (SELECT document_id FROM records WHERE record_key LIKE 'conflict/%' AND deleted=0)", (LIBRARY,)).fetchall()
+            rows = db.execute("SELECT id FROM documents WHERE id!=? AND loaded=1 AND reimport_revision IS NULL AND id NOT IN (SELECT document_id FROM pending_changes) AND id NOT IN (SELECT document_id FROM pending_requests) AND id NOT IN (SELECT document_id FROM records WHERE record_key LIKE 'conflict/%' AND deleted=0)", (LIBRARY,)).fetchall()
             rows = [row for row in rows if row[0] not in self._deferred]
             for row in rows:
                 db.execute("DELETE FROM records WHERE document_id=?", (row[0],))

@@ -51,10 +51,12 @@ Different services/accounts use isolated workspaces. A changed cloud library ide
 ## Compatibility and boundaries
 
 Trash uses the common backend interface and a confirmed revision for permanent
-deletion. The cloud publishes a terminal identity and removes its records;
+deletion. The cloud removes the document and its index entry, retaining a separate sync deletion receipt;
 stale devices retain unsent work for recovery/export instead of resurrecting
 the document. Local startup retention does not run against cloud trash or
-recovery copies. See [Trash](trash.md) for the implemented protocol and limits.
+recovery copies. Explicit reimport/generation reuses the same document ID, with
+a CAS against the deletion revision; older merge bases remain fenced. See
+[Trash](trash.md) for the implemented protocol and limits.
 
 Old local libraries are read in place, preserving original bytes and unknown files. The v1 wire snapshots remain readable; after v2 synchronization is enabled, legacy writes receive 409 rather than overwriting message trees/revisions. Database migrations add tables and retain old snapshots. No physical cloud garbage collection of blobs, tombstones, history or change-log entries occurs in this phase; retention windows and full-resync rules must precede it.
 

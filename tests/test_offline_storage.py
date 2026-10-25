@@ -159,6 +159,24 @@ class SQLiteDocuments(BackendContract, unittest.TestCase):
         self.root = Path(temp.name)
         self.backend = SQLiteBackend(self.root)
 
+    def test_explicit_generate_after_permanent_delete_refetches_same_arxiv_id(self):
+        from textfold import pipeline, store
+        identity = '2602.01219'
+        self.backend.save(Document(identity, meta={'id': identity, 'title': 'Old'},
+                                   source=Source(html='Old source'), notes={'notes': [{'text': 'Old note'}]}))
+        self.backend.trash(identity); self.backend.delete_trashed(identity)
+        def fetch_again(pid, root):
+            with store.edit(pid, create=True) as doc:
+                doc.meta = {'id': pid, 'title': 'Fetched again'}
+                doc.source.html = 'Freshly fetched original'
+        with store.use_backend(self.backend), mock.patch.object(pipeline, 'fetch', side_effect=fetch_again), \
+                mock.patch.object(store, 'parsed', side_effect=RuntimeError('Reached parsing')):
+            with self.assertRaisesRegex(RuntimeError, 'Reached parsing'):
+                pipeline.generate('https://arxiv.org/abs/' + identity, 'en', None)
+        fresh = self.backend.get(identity)
+        self.assertEqual(fresh.source.html, 'Freshly fetched original')
+        self.assertIsNone(fresh.notes)
+
     def test_replace_preserves_notes_and_previous_original(self):
         doc = Document('md-test', meta={'id': 'md-test'}, source=Source(markdown='Original', html='Original'))
         self.backend.save(doc)
@@ -373,6 +391,102 @@ class OfflineDevices(unittest.TestCase):
 
     def trash_entry(self, device):
         return next(row for row in device.list_trash() if row['id'] == self.identity)
+
+    def permanently_delete(self):
+        self.a.trash(self.identity); self.sync(self.a)
+        self.a.delete_trashed(self.identity, self.trash_entry(self.a)['revision']); self.sync(self.a)
+
+    def import_again(self, device, source='Fetched again'):
+        device.prepare_import(self.identity)
+        doc = device.get(self.identity)
+        self.assertIsNone(doc.meta)
+        doc.meta = {'id': self.identity, 'title': 'Reimported'}
+        doc.source = Source(html=source)
+        doc.notes = {'notes': [{'id': 'n-new', 'text': 'New note', 'anchor': {}}]}
+        device.save(doc)
+        return doc
+
+    def test_explicit_reimport_same_id_is_clean_and_reaches_other_devices(self):
+        self.seed(); self.permanently_delete(); self.sync(self.b)
+        self.import_again(self.a); self.sync(self.a); self.sync(self.b)
+        for device in (self.a, self.b):
+            doc = device.get(self.identity)
+            self.assertEqual(doc.id, self.identity)
+            self.assertEqual(doc.source.html, 'Fetched again')
+            self.assertEqual([n['id'] for n in doc.notes['notes']], ['n-new'])
+        self.assertTrue(any(d['id'] == self.identity for d in self.a.remote.sync_index()))
+
+    def test_offline_notes_before_delete_never_merge_into_reimport(self):
+        import io, zipfile
+        self.seed()
+        old = self.b.get(self.identity); old.notes['notes'][0]['text'] = 'Protected old offline note'
+        self.b.save(old)
+        self.permanently_delete(); self.import_again(self.a); self.sync(self.a)
+        status = self.b.sync()
+        self.assertGreater(status['pending'], 0)
+        self.assertTrue(self.trash_entry(self.b)['recovery'])
+        with self.assertRaises(ConflictError): self.b.prepare_import(self.identity)
+        self.b.clear_cache()
+        with zipfile.ZipFile(io.BytesIO(self.b.export_pending())) as archive:
+            self.assertIn('Protected old offline note', archive.read('pending.json').decode())
+        self.assertEqual([n['id'] for n in self.a.get(self.identity).notes['notes']], ['n-new'])
+        self.assertNotIn('Protected old offline note', records.canonical(self.a.remote.sync_snapshot(self.identity)))
+
+    def test_lost_reimport_ack_and_restart_keep_edits_without_old_notes(self):
+        self.seed(); self.permanently_delete(); self.import_again(self.a)
+        commit = self.a.remote.sync_commit
+        def lose(identity, payload):
+            commit(identity, payload)
+            raise StorageError('Lost reimport acknowledgement')
+        with mock.patch.object(self.a.remote, 'sync_commit', side_effect=lose):
+            self.assertIn('Lost reimport', self.a.sync()['error'])
+        doc = self.a.get(self.identity); doc.notes['notes'][0]['text'] = 'Edit after lost response'
+        self.a.save(doc)
+        self.a = self.device('a')
+        self.assertFalse(self.a.sync()['error'])  # acknowledge the first request before publishing later edits
+        self.sync(self.a); self.sync(self.b)
+        self.assertEqual(self.b.get(self.identity).notes['notes'][0]['text'], 'Edit after lost response')
+        self.assertEqual(len(self.b.get(self.identity).notes['notes']), 1)
+
+    def test_uncached_deleted_document_can_be_explicitly_imported_again(self):
+        self.seed(); self.permanently_delete()
+        fresh = self.device('new-device')
+        self.import_again(fresh); self.sync(fresh); self.sync(self.a)
+        self.assertEqual(self.a.get(self.identity).source.html, 'Fetched again')
+
+    def test_legacy_missing_index_marker_is_refreshed_before_explicit_reimport(self):
+        self.seed(); self.permanently_delete()
+        with self.a.cache.transaction() as db:
+            db.execute('UPDATE documents SET purged=0 WHERE id=?', (self.identity,))
+        self.import_again(self.a); self.sync(self.a)
+        self.assertEqual(self.a.get(self.identity).source.html, 'Fetched again')
+
+    def test_cloud_generate_after_purge_uses_same_arxiv_id_without_old_content(self):
+        from textfold import pipeline, store
+        self.identity = self.doc.id = '2602.01219'
+        self.doc.meta['id'] = self.identity
+        self.seed(); self.permanently_delete()
+        def fetch_again(pid, root):
+            with store.edit(pid, create=True) as doc:
+                doc.meta = {'id': pid, 'title': 'Fetched again'}
+                doc.source.html = 'Fresh original from arXiv'
+        with store.use_backend(self.a), mock.patch.object(pipeline, 'fetch', side_effect=fetch_again), \
+                mock.patch.object(store, 'parsed', side_effect=RuntimeError('Reached parsing')):
+            with self.assertRaisesRegex(RuntimeError, 'Reached parsing'):
+                pipeline.generate('https://arxiv.org/abs/' + self.identity, 'en', None)
+        self.sync(self.a)
+        self.assertIsNone(self.a.get(self.identity).notes)
+        self.assertEqual(self.a.remote.sync_snapshot(self.identity)['records']['source/html'], 'Fresh original from arXiv')
+
+    def test_competing_reimport_keeps_losing_local_source_for_recovery(self):
+        import io, zipfile
+        self.seed(); self.permanently_delete(); self.sync(self.b)
+        self.import_again(self.a, 'Source from A'); self.import_again(self.b, 'Source from B')
+        self.sync(self.a)
+        self.assertTrue(self.b.sync()['error'])
+        with zipfile.ZipFile(io.BytesIO(self.b.export_pending())) as archive:
+            self.assertIn('Source from B', archive.read('pending.json').decode())
+        self.assertEqual(self.a.get(self.identity).source.html, 'Source from A')
 
     def test_permanent_deletion_requires_clean_trash_and_is_terminal_across_restart(self):
         self.seed()

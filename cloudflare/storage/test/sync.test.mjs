@@ -118,7 +118,7 @@ test('permanent deletion is idempotent, terminal and cannot erase an active or r
   // Even an old client that knows the newest revision cannot resurrect it.
   assert.equal((await call('v2/documents/' + id, 'PUT', payload(initial(id), result.revision))).status, 409);
   assert.equal((await call('v2/documents/' + id, 'PUT', payload(initial(id)))).status, 409);
-  assert.equal((await ok('v2/index')).documents.find(d => d.id === id).purged, true);
+  assert.equal((await ok('v2/index')).documents.some(d => d.id === id), false);
 });
 
 test('legacy trash is indexed, restored losslessly and purged after the v2 fence', async () => {
@@ -193,4 +193,22 @@ test('purging one document keeps content-addressed attachments used by another',
   assert.deepEqual((await ok('v2/documents/md-keep-shared')).records['source/pdf'], ref);
   const blob = await call('v1/blobs/' + digest);
   assert.equal(blob.status, 200); assert.deepEqual(new Uint8Array(await blob.arrayBuffer()), bytes);
+});
+
+test('explicit reimport reuses the ID and fences edits based on deleted revisions', async () => {
+  const id = 'md-reimport';
+  const active = await ok('v2/documents/' + id, 'PUT', payload(initial(id)));
+  const trash = await ok('v2/documents/' + id, 'PUT', { ...payload([], active.revision), state: 'trash' });
+  const purged = await ok('v2/documents/' + id, 'PUT', { ...payload([], trash.revision), state: 'deleted', purge: true });
+  assert.equal((await ok('v2/index')).documents.some(d => d.id === id), false);
+  const request = { ...payload(initial(id), purged.revision), reimport_from: purged.revision, base_revision: null };
+  const fresh = await ok('v2/documents/' + id, 'PUT', request);
+  assert.equal(fresh.state, 'active'); assert.equal(fresh.purged, false);
+  assert.deepEqual(await ok('v2/documents/' + id, 'PUT', request), fresh);
+  // A stale client may fetch the newest revision and try rebasing old notes.
+  assert.equal((await call('v2/documents/' + id, 'PUT', payload(initial(id), fresh.revision))).status, 409);
+  assert.equal((await call('v2/documents/' + id, 'PUT', { ...payload([], fresh.revision), base_revision: active.revision })).status, 409);
+  const saved = await ok('v2/documents/' + id, 'PUT', { ...payload([], fresh.revision), base_revision: fresh.revision });
+  assert.equal((await ok('v2/documents/' + id)).revision, saved.revision);
+  assert.equal((await ok('v2/documents/' + id + '?base_revision=' + active.revision)).base_deleted, true);
 });

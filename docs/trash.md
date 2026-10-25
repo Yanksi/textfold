@@ -45,14 +45,25 @@ operation and outbox generation are acknowledged. A restart or lost response
 cannot lose the intent or publish it twice. A concurrent remote restore/edit
 cancels destructive intent and asks the user to review again.
 
-The service atomically removes document records and publishes a terminal
-`purged` tombstone with an idempotent operation and feed event. Even a client
-with the newest revision cannot restore or recreate that ID. Old clients that
-try merging into the tombstone receive 409. Other devices retain unacknowledged
+The service atomically removes document records and the document index entry,
+and retains a small deletion receipt in a separate synchronization table with
+an idempotent operation and feed event. Ordinary saves cannot restore deleted
+content, even with the newest revision. Other devices retain unacknowledged
 edits, uncertain requests and generation replies as protected recovery data,
 shown in Trash and exportable using Storage settings → Export pending changes.
 Cache cleanup and retention never discard these copies. They cannot upload
-against the purged identity; recovery under a new ID requires an explicit import.
+into a reimported copy. Explicit import or Generate can reuse the same document
+ID: `prepare_import(id)` prepares a clean local document only after checking
+that no unsent/recovery data would be replaced. The upload names the deletion
+revision the user is reimporting after. This intent is durable and generation
+still checkpoints locally before its final cloud publication. A newer deletion
+or competing reimport causes a conflict instead of overwriting either copy.
+
+Normal sync commits include the revision of their merge base. The service
+rejects bases at or before permanent deletion, including clients that fetch
+the latest revision and then try rebasing old notes onto it. Old clients that
+do not send a base cannot write to a reimported ID. Clean devices accept the new
+document; devices with old unsent work keep it in protected recovery/export.
 
 This is application-level deletion, not secure erasure of all historical bytes.
 R2 recovery snapshots and content-addressed blobs can be shared by revisions or
@@ -60,7 +71,9 @@ other documents and are not blindly deleted. Safe orphan garbage collection is
 separate; do not remove a blob simply because one document was purged.
 
 SQLite upgrades add columns in place without rewriting existing records or the
-outbox. Cloud migration `0004_trash.sql` retains existing rows. Legacy cloud trash
+outbox. Cloud migration `0004_trash.sql` adds permanent deletion; `0005` moves
+already-purged index entries into the separate deletion receipt table, without
+changing active/trash documents, record values, blobs or operation receipts. Legacy cloud trash
 is indexed by its latest retained token and can be restored losslessly after the
 v2 fence; permanent deletion removes retained rows for that ID. An active same-ID
 legacy document takes precedence and cannot be purged via the trash endpoint.

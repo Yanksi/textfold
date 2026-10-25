@@ -11,10 +11,12 @@ compare-and-swap publishes the complete snapshot. A failed upload or stale save
 cannot replace the previous revision. Listing reads only D1, never original PDFs.
 
 Trash is part of the same document interface. Migration `0004_trash.sql` adds
-terminal permanent deletion and keeps legacy trash restorable after v2 activation.
-Apply migrations before deploying the new Worker; existing records and blobs
+permanent deletion; `0005_deleted_index.sql` moves purged index rows to a separate
+sync receipt table. Explicit reimport reuses the same ID and old merge bases
+remain blocked. Legacy trash stays restorable after v2 activation.
+Apply migrations before deploying the new Worker; active records and blobs
 are retained. This migration requires the accompanying Worker, whose inserts
-name their columns and whose writes enforce terminal deletion. Older service
+name their columns and whose writes enforce deletion and merge-base checks. Older service
 versions lack the new purge route. Clients require its advertised capability
 and a dedicated endpoint, so an old server cannot silently interpret purge as
 a soft delete.

@@ -442,6 +442,7 @@ def take_file(jobs, data, headers):
     if not ext:
         return {"error": "not-supported"}, 400
     pid = pdfdoc.pid_of(data, ext)
+    store.repository().prepare_import(pid)
     f = store.DATA / "uploads" / f"{pid}.{ext}"
     f.parent.mkdir(parents=True, exist_ok=True)
     if store.has(pid):   # this file, converted before
@@ -475,6 +476,7 @@ def take_pdf(jobs, data, headers):
     except ValueError:
         refs = []
     pid = pdfdoc.pid_of(data)
+    store.repository().prepare_import(pid)
     f = store.DATA / "uploads" / f"{pid}.pdf"
     f.parent.mkdir(parents=True, exist_ok=True)
     if not f.exists():

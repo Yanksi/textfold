@@ -72,7 +72,7 @@ class SQLiteBackend:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
             columns = {row[1] for row in db.execute("PRAGMA table_info(documents)")}
-            for column, definition in (("purged", "INTEGER NOT NULL DEFAULT 0"), ("purge_base", "TEXT")):
+            for column, definition in (("purged", "INTEGER NOT NULL DEFAULT 0"), ("purge_base", "TEXT"), ("reimport_revision", "TEXT")):
                 if column not in columns:
                     db.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
             db.commit()
@@ -191,6 +191,20 @@ class SQLiteBackend:
                 raise ValueError("Original source is immutable; import changed content as a new document")
             self._blobs(blobs)
             document.revision, document.created, document.updated = self.write(db, document.id, value, dirty=True, created=document.created)
+
+    def prepare_import(self, identity):
+        self._identity(identity)
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM documents WHERE id=?", (identity,)).fetchone()
+            if not row or not row["purged"]:
+                return
+            protected = db.execute("SELECT 1 FROM pending_changes WHERE document_id=? UNION SELECT 1 FROM pending_requests WHERE document_id=? UNION SELECT 1 FROM records WHERE document_id=? AND record_key LIKE 'conflict/%' AND deleted=0", (identity, identity, identity)).fetchone()
+            if protected:
+                raise ConflictError("Local recovery data are protected; export them before importing this document again")
+            # Explicitly reuse the ID, not the deleted contents. Ordinary save
+            # still rejects deleted documents; only this entry point resets it.
+            db.execute("UPDATE documents SET created=?,remote_records='{}',remote_state='active',purge_base=NULL,purged=0,reimport_revision=?,remote_revision=NULL WHERE id=?", (time.time(), row["remote_revision"] if self.tracking else None, identity))
+            self.write(db, identity, {}, state="active")
 
     def reconcile(self, base, local, remote):
         """Merge IDs individually; conflict variants retain all unrelated history."""

@@ -184,6 +184,9 @@ class LocalDirectoryBackend:
                     continue
             return out
 
+    def prepare_import(self, document_id):
+        checked_id(document_id)  # Deleted local folders already leave no index.
+
     def delete(self, document_id):
         with self._lock:
             path = self._path(document_id)
@@ -358,6 +361,13 @@ class DocumentStore:
 
     def list_trash(self):
         return self.backend.list_trash()
+
+    def prepare_import(self, document_id):
+        """Explicit user import/generation; never used by ordinary saves/sync."""
+        checked_id(document_id)
+        prepare = getattr(self.backend, "prepare_import", None)
+        if prepare:
+            prepare(document_id)
 
     def restore(self, document_id, revision=None):
         return self.backend.restore(document_id) if revision is None else self.backend.restore(document_id, revision)

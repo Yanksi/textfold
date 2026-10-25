@@ -31,6 +31,8 @@ def generate(ref, lang, cfg, force=False, jobs=4, progress=lambda *a: None, log=
             raise llm.Stopped()
 
     pid = store.resolve(ref)
+    check()
+    store.repository().prepare_import(pid)
     with store.repository().workspace(pid):
         progress("fetch", 0, 1)
         if store.is_imported(pid):   # stored when it was opened (local.py), or fetched once from Europe PMC (epmc.py)

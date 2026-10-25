@@ -139,7 +139,7 @@ Documents; the generic storage adapter owns record reconciliation.
 | `GET /v2/changes?cursor=<integer>` | `{changes: [{sequence, document_id, revision, state}], cursor, more}` |
 | `GET /v2/documents/<id>` | `{records, revision, state, placement, info}` |
 | `PUT /v2/documents/<id>` | Apply one atomic sparse record commit; return `{revision, state, info}` |
-| `POST /v2/documents/<id>/purge` | Permanently delete a confirmed trash revision; terminal tombstone |
+| `POST /v2/documents/<id>/purge` | Permanently delete a confirmed trash revision; separate sync receipt |
 | `GET /v2/library` | Same snapshot envelope for the reserved organization document |
 | `PUT /v2/library` | Same atomic commit for organization records |
 
@@ -157,16 +157,36 @@ applies the same operation replay/hash rules, and returns `{revision, state,
 info, purged: true}`. In one transaction it removes records and legacy trash
 rows, records the idempotent operation, and appends a normal deleted feed event.
 Subsequent snapshots have `records: {}`, `purged: true`, and the confirming
-`operation_id`; permanent tombstones remain in the index. Every future write
-to that identity is rejected, including restore/recreate with the newest token.
+`operation_id`. Purged documents are absent from the document index; a separate
+`document_deletions` receipt retains ID, deletion revision, sequence and time.
+Ordinary future writes to that identity are rejected, even with the newest token.
 Replay of the original successful operation still returns its saved result.
 Failed CAS publishes nothing. Notifications are sent only after commit.
 
 A separate endpoint ensures older servers reject the request instead of
 silently treating it as soft deletion. Clients retain their local outbox until
 the purge is confirmed and quarantine other devices' unsent work for explicit
-recovery/export; they never merge it back into this identity. See
+recovery/export; they never merge it into a subsequently reimported document. See
 [trash.md](trash.md) for storage/retention and shared-object limitations.
+
+Services advertising `document_reimport: 1` allow explicit import/generation
+using the same ID. A normal `PUT /v2/documents/<id>` may supply `reimport_from`
+equal to the current deletion revision, `revision` equal to that revision,
+`base_revision: null`, and `state: "active"` with freshly imported records.
+This is a CAS creation after deletion, with normal idempotency; it never revives
+the deleted records. The user intent is persisted before upload and must not
+be inferred during automatic synchronization. Competing import/deletion rejects
+the stale intent without replacing its local content.
+
+After permanent deletion, ordinary commits require `base_revision`, naming the
+cloud revision on which their local edits were based, before merging newer
+remote records. Its change-log sequence must be newer than the deletion receipt.
+A missing, unknown or pre-deletion base returns 409, even when `revision` is the
+newest head. This fences stale clients that would otherwise merge old notes into
+a fresh import. `GET /v2/documents/<id>?base_revision=<revision>` reports
+`base_deleted`; an empty query value represents an unknown base. Clients keep
+unacknowledged changes in recovery rather than merging when it is true. Snapshots
+also report the latest `operation_id` so acknowledgements can be reconciled.
 
 ### Optional change notifications
 

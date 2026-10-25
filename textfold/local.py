@@ -131,6 +131,7 @@ def import_text(text, name="document.md", base=None):
     """Store a document given as text (base: the folder its relative image paths start from, if known). Returns its id."""
     title, html, meta = _read_md(text, name)
     pid = make_id(title, text)
+    store.repository().prepare_import(pid)
     return store_doc(pid, html, {"id": pid, **meta}, "markdown", text, lambda folder: Images(folder, base).resolve, sizes=True)
 
 

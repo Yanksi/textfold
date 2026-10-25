@@ -10,6 +10,14 @@ const put = (value: ObjectValue, key: string, item: Json): void => {
   Object.defineProperty(value, key, { value: item, enumerable: true, configurable: true, writable: true });
 };
 
+async function deletedBase(db: D1DatabaseSession, id: string, base: Json | undefined): Promise<boolean> {
+  const deletion = await db.prepare("SELECT sequence FROM document_deletions WHERE id=?1").bind(id).first<{ sequence: number }>();
+  if (!deletion) return false;
+  if (typeof base !== "string" || !base) return true;
+  const known = await db.prepare("SELECT sequence FROM change_log WHERE document_id=?1 AND revision=?2").bind(id, base).first<{ sequence: number }>();
+  return !known || known.sequence <= deletion.sequence;
+}
+
 function canonical(value: Json): string {
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
   if (value !== null && typeof value === "object") return "{" + Object.keys(value).sort().map(k => JSON.stringify(k) + ":" + canonical(value[k])).join(",") + "}";
@@ -198,6 +206,8 @@ async function current(env: StorageEnv, db: D1DatabaseSession, id: string): Prom
     const legacy = await db.prepare("SELECT revision,manifest_key FROM library_state WHERE singleton=1").first<{ revision: string; manifest_key: string }>();
     return legacy ? { head: { id, revision: legacy.revision, manifest_key: legacy.manifest_key, info_json: "{}", state: "active", placement_json: "{}", created: 0, updated: 0 }, values: librarySplit(await loadSnapshot(env, legacy.manifest_key)) } : { head: null, values: {} };
   }
+  const deleted = await db.prepare("SELECT revision,deleted_at FROM document_deletions WHERE id=?1").bind(id).first<{ revision: string; deleted_at: number }>();
+  if (deleted) return { head: { id, revision: deleted.revision, manifest_key: "", info_json: "{}", state: "deleted", placement_json: "{}", created: 0, updated: deleted.deleted_at, purged: 1 }, values: {} };
   const legacy = await db.prepare("SELECT * FROM documents WHERE id=?1").bind(id).first<Omit<Head, "state" | "placement_json">>();
   if (legacy) return { head: { ...legacy, state: "active", placement_json: "{}" }, values: await split(await loadSnapshot(env, legacy.manifest_key)) };
   const trash = await db.prepare("SELECT * FROM trash WHERE id=?1 ORDER BY deleted_at DESC,token DESC LIMIT 1").bind(id).first<Head & { token: string; deleted_at: number }>();
@@ -209,7 +219,7 @@ export async function handleSync(request: Request, env: StorageEnv, ctx: Executi
   if (path === "/v2/health" && request.method === "GET") {
     const library = await db.prepare("SELECT library_id,sync_enabled FROM storage_identity WHERE singleton=1").first<{ library_id: string; sync_enabled: number }>();
     const cursor = await db.prepare("SELECT COALESCE(MAX(sequence),0) AS cursor FROM change_log").first<{ cursor: number }>();
-    return reply({ format: "textfold/storage-v2", library_id: library!.library_id, cursor: cursor!.cursor, sync_enabled: Boolean(library!.sync_enabled), trash_purge: 1,
+    return reply({ format: "textfold/storage-v2", library_id: library!.library_id, cursor: cursor!.cursor, sync_enabled: Boolean(library!.sync_enabled), trash_purge: 1, document_reimport: 1,
       ...(notificationsEnabled(env) ? { notifications: { protocol: NOTIFICATION_PROTOCOL, path: "/v2/events" } } : {}) });
   }
   if (path === "/v2/events" && request.method === "GET") {
@@ -237,8 +247,8 @@ export async function handleSync(request: Request, env: StorageEnv, ctx: Executi
   const existing = await current(env, db, id), head = existing.head;
   if (request.method === "GET" && !match[3]) {
     if (!head && id !== LIBRARY) throw new Failure(404, "Document not found");
-    const operation = head?.purged ? await db.prepare("SELECT operation_id FROM sync_operations WHERE document_id=?1 AND revision=?2").bind(id, head.revision).first<{ operation_id: string }>() : null;
-    return reply({ records: existing.values, revision: head?.revision ?? null, state: head?.state ?? "active", purged: Boolean(head?.purged), operation_id: operation?.operation_id ?? null, placement: JSON.parse(head?.placement_json ?? "{}"), info: JSON.parse(head?.info_json ?? "{}") });
+    const operation = head ? await db.prepare("SELECT operation_id FROM sync_operations WHERE document_id=?1 AND revision=?2").bind(id, head.revision).first<{ operation_id: string }>() : null;
+    return reply({ records: existing.values, revision: head?.revision ?? null, state: head?.state ?? "active", purged: Boolean(head?.purged), base_deleted: url.searchParams.has("base_revision") && await deletedBase(db, id, url.searchParams.get("base_revision")), operation_id: operation?.operation_id ?? null, placement: JSON.parse(head?.placement_json ?? "{}"), info: JSON.parse(head?.info_json ?? "{}") });
   }
   if (request.method !== (match[3] ? "POST" : "PUT")) throw new Failure(405, "Method not allowed");
   const body = await jsonBody(request), operation = revision(body.operation_id), expected = revision(body.revision);
@@ -251,7 +261,10 @@ export async function handleSync(request: Request, env: StorageEnv, ctx: Executi
     return reply(JSON.parse(replay.result_json));
   }
   if (expected !== (head?.revision ?? null)) throw new Failure(409, "Cloud document changed; reconcile and retry");
-  if (head?.purged) throw new Failure(409, "Document was permanently deleted; this identity cannot be restored");
+  const reimport = head?.purged && body.reimport_from === head.revision && body.state === "active" && !match[3];
+  if (head?.purged && !reimport) throw new Failure(409, "Document was permanently deleted; explicitly import it again");
+  if (own(body, "reimport_from") && !reimport) throw new Failure(409, "Deletion changed; review the import before retrying");
+  if (!reimport && !head?.purged && await deletedBase(db, id, body.base_revision)) throw new Failure(409, "Changes are based on a permanently deleted document; export them instead of merging into the reimport");
   if (own(body, "purge") && typeof body.purge !== "boolean") throw new Failure(400, "Invalid purge flag");
   const purge = body.purge === true;
   if (purge && (id === LIBRARY || head?.state !== "trash" || body.state !== "deleted" || !Array.isArray(body.changes) || body.changes.length)) throw new Failure(409, "Only the confirmed trash revision can be permanently deleted");
@@ -316,7 +329,7 @@ export async function handleSync(request: Request, env: StorageEnv, ctx: Executi
     ? db.prepare("UPDATE sync_documents SET revision=?1,manifest_key=?2,info_json=?3,state=?4,placement_json=?5,updated=?6 WHERE id=?7 AND revision=?8").bind(commit, key, JSON.stringify(info), body.state, JSON.stringify(placement), updated, id, expected)
     : id === LIBRARY
       ? db.prepare("INSERT INTO sync_documents(id,revision,manifest_key,info_json,state,placement_json,created,updated) SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE (?9 IS NULL AND NOT EXISTS(SELECT 1 FROM library_state WHERE singleton=1)) OR EXISTS(SELECT 1 FROM library_state WHERE singleton=1 AND revision=?9) ON CONFLICT(id) DO NOTHING").bind(id, commit, key, JSON.stringify(info), body.state, JSON.stringify(placement), created, updated, expected)
-      : db.prepare("INSERT INTO sync_documents(id,revision,manifest_key,info_json,state,placement_json,created,updated) SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE (?9 IS NULL AND NOT EXISTS(SELECT 1 FROM documents WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM trash WHERE id=?1)) OR EXISTS(SELECT 1 FROM documents WHERE id=?1 AND revision=?9) OR (NOT EXISTS(SELECT 1 FROM documents WHERE id=?1) AND ?9=(SELECT token FROM trash WHERE id=?1 ORDER BY deleted_at DESC,token DESC LIMIT 1)) ON CONFLICT(id) DO NOTHING").bind(id, commit, key, JSON.stringify(info), body.state, JSON.stringify(placement), created, updated, expected)];
+      : db.prepare("INSERT INTO sync_documents(id,revision,manifest_key,info_json,state,placement_json,created,updated) SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE (?9 IS NULL AND NOT EXISTS(SELECT 1 FROM documents WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM trash WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM document_deletions WHERE id=?1)) OR EXISTS(SELECT 1 FROM documents WHERE id=?1 AND revision=?9) OR (NOT EXISTS(SELECT 1 FROM documents WHERE id=?1) AND ?9=(SELECT token FROM trash WHERE id=?1 ORDER BY deleted_at DESC,token DESC LIMIT 1)) OR (?10=1 AND EXISTS(SELECT 1 FROM document_deletions WHERE id=?1 AND revision=?9)) ON CONFLICT(id) DO NOTHING").bind(id, commit, key, JSON.stringify(info), body.state, JSON.stringify(placement), created, updated, expected, reimport ? 1 : 0)];
   if (purge) {
     statements.push(db.prepare(`UPDATE sync_documents SET purged=1 WHERE id=?1 AND ${guard}`).bind(id, commit));
     statements.push(db.prepare(`DELETE FROM document_records WHERE document_id=?1 AND ${guard}`).bind(id, commit));
@@ -338,6 +351,10 @@ export async function handleSync(request: Request, env: StorageEnv, ctx: Executi
   if (head?.token) statements.push(db.prepare(`DELETE FROM trash WHERE token=?3 AND ${guard}`).bind(id, commit, head.token));
   statements.push(db.prepare(`INSERT INTO change_log(document_id,revision,state,operation_id) SELECT ?1,?2,?3,?4 WHERE ${guard}`).bind(id, commit, body.state, operation));
   statements.push(db.prepare(`UPDATE storage_identity SET sync_enabled=1 WHERE singleton=1 AND ${guard}`).bind(id, commit));
+  if (purge) {
+    statements.push(db.prepare(`INSERT INTO document_deletions(id,revision,sequence,deleted_at) SELECT ?1,?2,sequence,?3 FROM change_log WHERE document_id=?1 AND revision=?2 AND ${guard} ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,sequence=excluded.sequence,deleted_at=excluded.deleted_at`).bind(id, commit, updated));
+    statements.push(db.prepare(`DELETE FROM sync_documents WHERE id=?1 AND ${guard}`).bind(id, commit));
+  }
   const committed = await db.batch(statements);
   if (committed[0].meta.changes !== 1) {
     // Another request with this operation ID may have committed after our

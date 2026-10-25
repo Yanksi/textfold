@@ -369,6 +369,54 @@ class OfflineDevices(unittest.TestCase):
         self.sync(self.a); self.sync(self.b)
         self.assertIn('saved without network', self.b.get(identity).source.markdown)
 
+    def test_generation_batches_remote_publication_but_keeps_local_checkpoints(self):
+        self.seed()
+        with self.a.defer_sync(self.identity):
+            partial = self.a.get(self.identity)
+            partial.layers['en'] = {'version':'completed-native'}
+            self.a.save(partial)
+            result = self.a.sync()
+            self.assertFalse(result['error'], result)
+            self.assertGreater(result['pending'], 0)
+            self.sync(self.b)
+            self.assertNotIn('en', self.b.get(self.identity).layers)
+            other = Document('md-independent-'+uuid.uuid4().hex, meta={'title':'Other'}, source=Source(html='Other'))
+            self.a.save(other)
+            self.assertFalse(self.a.sync()['error'])
+            self.sync(self.b)
+            self.assertEqual(self.b.get(other.id).source.html, 'Other')
+            complete = self.a.get(self.identity)
+            complete.layers['tr-zh'] = {'version':'completed-translation'}
+            self.a.save(complete)
+        self.sync(self.a); self.sync(self.b)
+        self.assertEqual(self.b.get(self.identity).layers, complete.layers)
+        self.assertEqual(self.b.get(self.identity).source.pdf, self.doc.source.pdf)
+
+    def test_generation_start_during_snapshot_fetch_prevents_partial_upload(self):
+        self.seed()
+        changed = self.a.get(self.identity)
+        changed.meta['title'] = 'Local change'
+        self.a.save(changed)
+        actual = self.a._snapshot
+        lease = self.a.defer_sync(self.identity)
+        started = False
+        def racing(identity):
+            nonlocal started
+            result = actual(identity)
+            if identity == self.identity and not started:
+                lease.__enter__()
+                started = True
+            return result
+        try:
+            with mock.patch.object(self.a, '_snapshot', racing), mock.patch.object(self.a.remote, 'sync_commit', wraps=self.a.remote.sync_commit) as commit:
+                self.a._push(self.identity)
+                self.assertTrue(started)
+                self.assertEqual(commit.call_count, 0)
+        finally:
+            if started: lease.__exit__(None,None,None)
+        self.sync(self.a); self.sync(self.b)
+        self.assertEqual(self.b.get(self.identity).meta['title'], 'Local change')
+
     def test_metadata_only_trash_can_be_restored_after_cache_cleanup_and_restart(self):
         self.seed()
         self.a.trash(self.identity, {'of': 'f-kept'}); self.sync(self.a); self.sync(self.b)

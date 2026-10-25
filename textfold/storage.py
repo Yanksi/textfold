@@ -286,6 +286,9 @@ class DocumentStore:
             self._sessions.paths = {}
         return self._sessions.paths
 
+    def in_workspace(self, identity):
+        return identity in self._active()
+
     def get(self, identity):
         checked_id(identity)
         if identity in self._active():
@@ -341,6 +344,8 @@ class DocumentStore:
 
     # Compatibility for old importers only. A backend doesn't implement these.
     def has(self, identity, name="meta.json"):
+        if identity in self._active():
+            return DirectoryFiles(self._active()[identity].folder).exists(name)
         if isinstance(self.backend, LocalDirectoryBackend) and identity not in self._active():
             return DirectoryFiles(self.backend._path(identity)).exists(name)
         try:
@@ -350,6 +355,8 @@ class DocumentStore:
         return checked_key(name) in LegacyLayout.encode(doc)
 
     def read_asset(self, identity, name):
+        if identity in self._active():
+            return DirectoryFiles(self._active()[identity].folder).read(name)
         if isinstance(self.backend, LocalDirectoryBackend) and identity not in self._active():
             return DirectoryFiles(self.backend._path(identity)).read(name)
         raw = LegacyLayout.encode(self.get(identity))
@@ -359,6 +366,9 @@ class DocumentStore:
             raise FileNotFoundError(name) from None
 
     def write_asset(self, identity, name, data):
+        if identity in self._active():
+            DirectoryFiles(self._active()[identity].folder).write(checked_key(name), data)
+            return
         if isinstance(self.backend, LocalDirectoryBackend) and identity not in self._active():
             with self.backend._lock:
                 DirectoryFiles(self.backend.root / 'papers' / checked_id(identity)).write(checked_key(name), data)
@@ -387,12 +397,29 @@ class DocumentStore:
         if current != original:
             saved = self._publish(identity, session.base, original, current)
             base = saved if saved is not None else Document(identity)
-            LegacyLayout.write_folder(session.folder, LegacyLayout.encode(base))
+            # Refresh only concurrent changes; large originals already on disk
+            # need neither a second read nor another copy at every checkpoint.
+            updated = LegacyLayout.encode(base)
+            files = DirectoryFiles(session.folder)
+            for key in current.keys() - updated.keys():
+                files.path(key).unlink()
+            for key, value in updated.items():
+                if current.get(key) != value:
+                    files.write(key, value)
             session.base = base
         return True
 
     @contextlib.contextmanager
     def workspace(self, identity, write=True):
+        checked_id(identity)
+        defer = getattr(self.backend, "defer_sync", None)
+        outer = write and identity not in self._active() and defer is not None
+        with defer(identity) if outer else contextlib.nullcontext():
+            with self._workspace(identity, write) as folder:
+                yield folder
+
+    @contextlib.contextmanager
+    def _workspace(self, identity, write=True):
         """Parser bridge: materialize a document and merge completed changes.
 
         This is application code, never something a backend provides. Model replies

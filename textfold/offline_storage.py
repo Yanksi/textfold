@@ -1,5 +1,6 @@
 """Cloud authority with a durable SQLite working copy, outbox and safe cache."""
 import copy
+import contextlib
 import hashlib
 import io
 import json
@@ -55,6 +56,21 @@ class OfflineBackend:
         self._online, self._error, self._last_sync = False, "", 0
         self._import = None
         self._job = None
+        self._deferred = {}   # document-scoped generation leases; SQLite writes remain durable
+
+    @contextlib.contextmanager
+    def defer_sync(self, identity):
+        with self.cache.lock:
+            self._deferred[identity] = self._deferred.get(identity, 0) + 1
+        try:
+            yield
+        finally:
+            with self.cache.transaction() as db:
+                self._deferred[identity] -= 1
+                if self._deferred[identity] == 0:
+                    del self._deferred[identity]
+                    if db.execute("SELECT 1 FROM pending_changes WHERE document_id=?", (identity,)).fetchone():
+                        self.request_sync()
 
     def start(self):
         with self._lifecycle:
@@ -97,7 +113,10 @@ class OfflineBackend:
         self.request_sync(reason)
 
     def status(self):
-        return {**self.cache.status(), "online": self._online, "syncing": self._sync_lock.locked(),
+        with self.cache.lock:
+            cached = self.cache.status()
+            cached["pending"] = max(cached["pending"], len(self._deferred))
+        return {**cached, "online": self._online, "syncing": self._sync_lock.locked(),
                 "error": self._error or self.configuration_error, "lastSync": self._last_sync,
                 "import": self._import, "job": self._job, "notifications": self._notifications.status()}
 
@@ -262,6 +281,8 @@ class OfflineBackend:
     def _push(self, identity):
         # Retry an uncertain write byte-for-byte before forming another request.
         with self.cache.transaction() as db:
+            if identity in self._deferred:
+                return
             request = db.execute("SELECT * FROM pending_requests WHERE document_id=?", (identity,)).fetchone()
         if request:
             try:
@@ -274,6 +295,8 @@ class OfflineBackend:
             snapshot = self._snapshot(identity)
             ids_blobs = self._bytes({k: v for k, v in snapshot["records"].items() if k in ("extensions/ids.json", "legacy/ids.json")})
             with self.cache.transaction() as db:
+                if identity in self._deferred:
+                    return
                 self.cache._blobs(ids_blobs)
                 row = db.execute("SELECT * FROM documents WHERE id=?", (identity,)).fetchone()
                 pending = db.execute("SELECT * FROM pending_changes WHERE document_id=?", (identity,)).fetchone()
@@ -329,7 +352,8 @@ class OfflineBackend:
             self._online, self._error, self._blocked = True, "", False
             with self.cache.transaction() as db:
                 cursor = db.execute("SELECT value FROM sync_state WHERE key='cursor'").fetchone()
-                pending = [row[0] for row in db.execute("SELECT document_id FROM pending_changes UNION SELECT document_id FROM pending_requests")]
+                pending = [row[0] for row in db.execute("SELECT document_id FROM pending_changes UNION SELECT document_id FROM pending_requests")
+                           if row[0] not in self._deferred]
                 library_ready = db.execute("SELECT 1 FROM documents WHERE id=? AND loaded=1", (LIBRARY,)).fetchone()
                 baseline = db.execute("SELECT 1 FROM sync_state WHERE key='v2_baseline' AND value='complete'").fetchone()
             # Legacy writes have no feed entries. A loaded library/cursor from
@@ -453,8 +477,10 @@ class OfflineBackend:
         return self.cache.list()
 
     def save(self, document):
-        self.cache.save(document)
-        self.request_sync()
+        with self.cache.lock:
+            self.cache.save(document)
+            if document.id not in self._deferred:
+                self.request_sync()
 
     def delete(self, identity):
         self.get(identity)
@@ -518,6 +544,7 @@ class OfflineBackend:
     def clear_cache(self):
         with self.cache.transaction() as db:
             rows = db.execute("SELECT id FROM documents WHERE id!=? AND loaded=1 AND id NOT IN (SELECT document_id FROM pending_changes) AND id NOT IN (SELECT document_id FROM pending_requests) AND id NOT IN (SELECT document_id FROM records WHERE record_key LIKE 'conflict/%' AND deleted=0)", (LIBRARY,)).fetchall()
+            rows = [row for row in rows if row[0] not in self._deferred]
             for row in rows:
                 db.execute("DELETE FROM records WHERE document_id=?", (row[0],))
                 db.execute("UPDATE documents SET loaded=0,remote_records='{}' WHERE id=?", (row[0],))

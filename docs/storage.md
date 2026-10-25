@@ -106,6 +106,16 @@ Backends **do not implement** `workspace`, file IO, directory scans or synchroni
 of temporary directories. `store.pdir`, `asset` and filename-based helpers remain
 compatibility details for these integrations, not the backend interface.
 
+In cloud mode, the outer writable workspace defers publication of that document
+until generation finishes or stops. Checkpoints still commit locally to SQLite,
+so another reader can open completed stages and failed generations retain their
+completed replies. A pending document stays in the outbox and survives restart;
+closing the workspace requests one synchronization. Manual/periodic sync skips
+that document while it is being generated; other documents continue syncing.
+Nested workspaces share the deferral. Active documents cannot be evicted or
+silently left behind by switching libraries. Small parser reads and layer writes
+use the local working files directly instead of decoding PDFs and images.
+
 `tests/test_storage.py` runs the same semantic operations against disk and a
 memory adapter storing complete Document objects, with no file/path methods.
 It tests originals, notes, layers, PDF parsing, generation, replacement, trash,

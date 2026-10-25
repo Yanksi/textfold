@@ -299,7 +299,7 @@ def _file(pid, name):
 
 
 def read(pid, name):
-    if is_local():
+    if is_local() or repository().in_workspace(pid):
         f = _file(pid, name)
         return json.loads(read_text(f)) if f.exists() else None
     try:
@@ -309,7 +309,7 @@ def read(pid, name):
 
 
 def write(pid, name, data):
-    if is_local():
+    if is_local() or repository().in_workspace(pid):
         f = _file(pid, name)
         f.parent.mkdir(parents=True, exist_ok=True)
         tmp = f.with_suffix(".tmp")
@@ -334,7 +334,7 @@ def text_lang(pid, en=None):
     formulas, code and the references (langs.detect). en: the ladder, when it is read already."""
     if en and en.get("lang") in langs.LANGS:
         return en["lang"]
-    if not is_local():
+    if not is_local() and not repository().in_workspace(pid):
         en = read(pid, "en") if en is None else en
         if en and en.get("lang") in langs.LANGS:
             return en["lang"]
@@ -397,14 +397,14 @@ def apply_tr(doc, lang, tr):
 
 
 def languages(pid):
-    if is_local():
+    if is_local() or repository().in_workspace(pid):
         d = pdir(pid) / "layers"
         return sorted(f.stem[3:] for f in d.glob("tr-*.json")) if d.exists() else []
     return sorted(k[3:] for k in document(pid).layers if k.startswith("tr-"))
 
 
 def parsed(pid):
-    if is_local():
+    if is_local() or repository().in_workspace(pid):
         d = pdir(pid)
         return parse(read_text(d / "source.html"), json.loads(read_text(d / "meta.json")))
     doc = document(pid)

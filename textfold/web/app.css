@@ -135,10 +135,11 @@
 .sb-dragimg { position: fixed; top: -200px; left: 0; padding: 6px 11px; border-radius: 8px; font: 600 13px var(--sans); color: var(--ink);
   background: var(--card); border: 1px solid var(--line); white-space: nowrap; }
 .sb-foot { border-top: 1px solid var(--line-2); padding: 10px 12px 14px; }
-.sb-settings, .sb-help, .sb-zotero { width: 100%; text-align: left; border: 0; background: none; font: 550 13px var(--sans); color: var(--ink-2); padding: 6px 4px; border-radius: 7px; cursor: pointer; }
-.sb-settings:hover, .sb-help:hover, .sb-zotero:hover { background: var(--surface); }
-.sb-zotero { display: flex; align-items: center; gap: 6px; }
-.sb-zotero svg { width: 15px; height: 15px; flex: none; }
+.sb-settings, .sb-help, .sb-zotero, .sb-trash { width: 100%; text-align: left; border: 0; background: none; font: 550 13px var(--sans); color: var(--ink-2); padding: 6px 4px; border-radius: 7px; cursor: pointer; }
+.sb-settings:hover, .sb-help:hover, .sb-zotero:hover, .sb-trash:hover { background: var(--surface); }
+.sb-zotero, .sb-trash { display: flex; align-items: center; gap: 6px; }
+.sb-zotero svg, .sb-trash svg { width: 15px; height: 15px; flex: none; }
+.sb-trash svg, .rail-trash svg { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
 /* its edge, dragged to change its width */
 .sb-resize { position: absolute; top: 0; bottom: 0; right: -4px; width: 8px; cursor: col-resize; touch-action: none; z-index: 1; }
 .sb-resize::after { content: ''; position: absolute; top: 0; bottom: 0; left: 3px; width: 2px; background: var(--accent); opacity: 0; transition: opacity .15s; }
@@ -304,6 +305,19 @@ dialog.settings { border: 1px solid var(--line); border-radius: 16px; padding: 0
 dialog.settings::backdrop { background: rgba(30, 25, 15, .28); }
 .st { padding: 22px 24px 20px; font-family: var(--sans); }
 .st h2 { margin: 0 0 14px; font-size: 18px; }
+.trash-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.trash-heading h2 { margin: 0; }
+.trash-close { border: 0; background: none; color: var(--muted); font-size: 25px; cursor: pointer; }
+.trash-list { margin-top: 20px; }
+.trash-row { display: flex; align-items: center; gap: 16px; padding: 16px 0; border-top: 1px solid var(--line); }
+.trash-document { flex: 1; min-width: 0; display: grid; gap: 5px; }
+.trash-document b { font-size: 14px; overflow-wrap: anywhere; }
+.trash-document span, .trash-empty { font-size: 12px; color: var(--muted); }
+.trash-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.trash-actions button, .trash-list > button { font: 13px var(--sans); padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); cursor: pointer; }
+dialog.trash-dialog .trash-delete { color: var(--r-gap); }
+.trash-actions button:disabled { opacity: .45; cursor: default; }
+@media (max-width: 520px) { .trash-row { align-items: flex-start; flex-direction: column; gap: 10px; } }
 .st-opt { display: flex; gap: 10px; align-items: center; padding: 8px 0; font-weight: 550; font-size: 14.5px; cursor: pointer; }
 .st-sub { display: grid; gap: 10px; padding: 4px 0 10px 26px; }
 .st-sub label { display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); }

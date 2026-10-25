@@ -81,6 +81,7 @@
     document.dispatchEvent(new Event('tf-lang'));   // (what else speaks it: the app's update)
   }
   let papers = BOOT.papers || [];
+  let trashDialog = null;
   let folders = BOOT.folders || { folders: [], of: {} };   // the reader's folders (each in its parent, or at the top), and which document is in which (library.py)
   let sbQuery = '';        // the sidebar's search, as typed
   let editing = null;      // a folder's name being written: 'new', or the folder's id
@@ -203,6 +204,7 @@
         <button type="button" class="rail-btn rail-open" title="${esc(T.expand)}">${LIST}</button>
         <a class="rail-btn" href="/" title="${esc(T.new_paper)}">＋</a>
         <button type="button" class="rail-btn rail-settings" title="${esc(T.settings)}">⚙</button>
+        <button type="button" class="rail-btn rail-trash" title="${esc(T.trash_title)}" aria-label="${esc(T.trash_title)}">${svg('bin')}</button>
         ${window.TFTutorial && PAPER ? `<button type="button" class="rail-btn rail-help" title="${esc(T.tut_open)}">?</button>` : ''}
       </div>
       <div class="sb-find"><input type="search" class="sb-q" value="${esc(sbQuery)}" placeholder="${esc(T.sb_search)}" aria-label="${esc(T.sb_search)}" autocomplete="off" spellcheck="false">` +
@@ -215,7 +217,7 @@
         `<span class="sb-cn">${esc(T.sel_n.replace('{n}', chosen.size))}</span><button type="button" class="sb-cmove">${esc(T.sel_move)}</button>` +
         `<button type="button" class="sb-cdel">${esc(T.sel_delete)}</button>` +
         `<button type="button" class="sb-cx" title="${esc(T.sel_clear)}" aria-label="${esc(T.sel_clear)}">×</button></div>` : ''}
-      <div class="sb-foot"><button type="button" class="sb-zotero">${BOOKS}${esc(T.z_lib)}</button><button type="button" class="sb-settings">⚙ ${esc(T.settings)}</button>${window.TFTutorial && PAPER ? `<button type="button" class="sb-help">? ${esc(T.tut_open)}</button>` : ''}<div class="sb-model">${esc(modelLabel())}</div></div>
+      <div class="sb-foot"><button type="button" class="sb-zotero">${BOOKS}${esc(T.z_lib)}</button><button type="button" class="sb-trash">${svg('bin')}${esc(T.trash_title)}</button><button type="button" class="sb-settings">⚙ ${esc(T.settings)}</button>${window.TFTutorial && PAPER ? `<button type="button" class="sb-help">? ${esc(T.tut_open)}</button>` : ''}<div class="sb-model">${esc(modelLabel())}</div></div>
       <div class="sb-resize" role="separator" aria-orientation="vertical" tabindex="0" title="${esc(T.sb_resize)}" aria-label="${esc(T.sb_resize)}"></div>`;
     // polled every second while something generates: drawn again only when it changed, and where it was scrolled to
     const busy = jobs.some(live);
@@ -235,6 +237,7 @@
     side.querySelector('.sb-pin').onclick = () => setPinned(!pinned);
     side.querySelector('.rail-open').onclick = () => setCollapsed(false);
     side.querySelectorAll('.sb-settings, .rail-settings').forEach((b) => { b.onclick = openSettings; });
+    side.querySelectorAll('.sb-trash, .rail-trash').forEach((b) => { b.onclick = openTrash; });
     side.querySelector('.sb-zotero').onclick = () => openLibrary();
     side.querySelectorAll('.sb-help, .rail-help').forEach((b) => { b.onclick = (e) => { e.stopPropagation(); window.TFTutorial.open(uiLang); }; });
     side.querySelectorAll('.sb-del').forEach((b) => { b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); deletePaper(b.dataset.del); }; });
@@ -898,6 +901,54 @@
 
   // ── a delete's Undo: for ten seconds the corner says what went, with a button that brings it back as it was (in
   //    its folder, under its name); the paper being read, deleted, is offered back on the page it goes to ──
+  async function openTrash() {
+    if (trashDialog) { trashDialog.focus(); return; }
+    const T = t(), dlg = h('dialog', 'settings trash-dialog');
+    trashDialog = dlg;
+    dlg.setAttribute('aria-labelledby', 'trash-title');
+    dlg.innerHTML = `<div class="st"><div class="trash-heading"><h2 id="trash-title">${esc(T.trash_title)}</h2><button type="button" class="trash-close" aria-label="${esc(T.close)}">×</button></div>` +
+      `<p class="st-note">${esc(T.trash_hint)}</p><p class="trash-error st-note warn" role="alert" hidden></p><div class="trash-list" aria-live="polite"></div></div>`;
+    const list = dlg.querySelector('.trash-list'), error = dlg.querySelector('.trash-error');
+    let busy = false;
+    const fail = (err) => { error.hidden = false; error.textContent = err.message; };
+    async function load() {
+      const rows = await api('/api/trash');
+      if (!dlg.open) return;
+      list.innerHTML = rows.length ? rows.map((p) => `<div class="trash-row"><div class="trash-document"><b>${esc(p.title)}</b>` +
+        `<span>${esc(p.id)} · ${esc(new Date(p.deleted_at * 1000).toLocaleDateString(I18N.htmlLang(uiLang)))}</span></div>` +
+        `<div class="trash-actions"><button type="button" data-restore="${esc(p.id)}"${p.restorable ? '' : ' disabled'} title="${esc(p.restorable ? T.trash_restore : T.trash_exists)}">${esc(T.trash_restore)}</button>` +
+        `<button type="button" class="trash-delete" data-erase="${esc(p.id)}">${esc(T.trash_delete)}</button></div></div>`).join('')
+        : `<p class="trash-empty">${esc(T.trash_empty)}</p>`;
+      for (const button of list.querySelectorAll('button')) button.onclick = async () => {
+        if (busy) return;
+        const pid = button.dataset.erase || button.dataset.restore;
+        const paper = rows.find((p) => p.id === pid);
+        if (button.dataset.erase && !confirm(T.trash_confirm.replace('{title}', paper.title))) return;
+        busy = true; error.hidden = true;
+        list.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        try {
+          if (button.dataset.erase) await api('/api/trash/delete', { paper: pid });
+          else {
+            const r = await api('/api/papers/restore', { papers: [pid] });
+            papers = r.papers; folders = r.folders; renderSidebar();
+            if (!r.restored.includes(pid)) throw new Error(T.trash_changed);
+          }
+          await load();
+        } catch (err) { fail(err); try { await load(); } catch { /* keep the original error */ } }
+        finally { busy = false; }
+      };
+    }
+    dlg.querySelector('.trash-close').onclick = () => dlg.close();
+    dlg.addEventListener('close', () => { dlg.remove(); if (trashDialog === dlg) trashDialog = null; });
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
+    document.body.append(dlg); dlg.showModal();
+    list.textContent = T.loading || '…';
+    try { await load(); } catch (err) {
+      fail(err); list.innerHTML = `<button type="button">${esc(T.st_retry)}</button>`;
+      list.querySelector('button').onclick = () => { dlg.close(); openTrash(); };
+    }
+  }
+
   const UNDO = 'textfold.undo', UNDO_MS = 10000;
   const undoBox = h('div', 'gen-toast undo-toast');
   undoBox.hidden = true; toasts.append(undoBox);

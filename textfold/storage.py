@@ -224,6 +224,57 @@ class LocalDirectoryBackend:
             (folder / "library.json").unlink(missing_ok=True)
             return kept if isinstance(kept, dict) else {}
 
+    def list_trash(self):
+        """The latest retained copy of each document, without opening its payloads."""
+        from .store import valid_id
+        with self._lock:
+            root = self.root / "papers" / ".trash"
+            rows = {}
+            for folder in sorted(root.iterdir()) if root.is_dir() else []:
+                match = re.fullmatch(r"(.+)-(\d{8}-\d{6})", folder.name)
+                if not (match and valid_id(match[1]) and folder.is_dir()):
+                    continue
+                try:
+                    deleted = time.mktime(time.strptime(match[2], "%Y%m%d-%H%M%S"))
+                    meta = json.loads(decode_text((folder / "meta.json").read_bytes()))
+                    if not isinstance(meta, dict):
+                        continue
+                except (OSError, ValueError, OverflowError):
+                    continue
+                identity = match[1]
+                rows[identity] = {"id": identity, "title": meta.get("title") or identity,
+                                  "deleted_at": deleted, "restorable": not (self.root / "papers" / identity).exists()}
+            return sorted(rows.values(), key=lambda row: row["deleted_at"], reverse=True)
+
+    def delete_trashed(self, document_id):
+        """Erase retained copies only; a linked original and an active copy stay intact."""
+        from .store import valid_id
+        if not valid_id(document_id):
+            raise ValueError("Invalid document id")
+        with self._lock:
+            root = self.root / "papers" / ".trash"
+            pattern = re.compile(re.escape(document_id) + r"-\d{8}-\d{6}")
+            removed = False
+            for folder in list(root.iterdir()) if root.is_dir() else []:
+                if not pattern.fullmatch(folder.name):
+                    continue
+                try:
+                    time.strptime(folder.name[-15:], "%Y%m%d-%H%M%S")
+                except ValueError:
+                    continue
+                if folder.is_symlink():
+                    folder.unlink()
+                elif getattr(folder, "is_junction", lambda: False)():
+                    os.rmdir(folder)   # remove the junction, never traverse its target
+                elif folder.is_dir():
+                    if folder.resolve().parent != root.resolve():
+                        raise ValueError("Trash entry escapes its folder")
+                    shutil.rmtree(folder)
+                else:
+                    continue
+                removed = True
+            return removed
+
     def purge(self, before):
         from .store import valid_id
         with self._lock:

@@ -5,6 +5,8 @@
   GET  /api/papers            the papers on disk, each with when it came in and was last opened (library.py), and its
                               citekey when it was read from a Zotero item that has one (zotero.citekeys)
   GET  /api/jobs              generation jobs (queued, running, recently finished)
+  GET  /api/trash             retained documents: id, title, deletion time and whether restoration is possible
+  POST /api/trash/delete      {paper}: permanently erase that document's retained copies only, never an active copy
   POST /api/jobs/stop         {id}: stop a job: a queued one is dropped; a running one ends once the model calls under way
                               return (what they wrote is kept in the cache, so starting it again goes on from there)
   POST /api/generate          {paper, lang, force}: queue a generation; one runs at a time. paper: an arXiv id or
@@ -671,6 +673,11 @@ def make_handler(jobs):
                         return self.send(200, f.read_bytes(), VENDOR_TYPES[f.suffix], cache="max-age=86400")
                 if u.path == "/api/papers":
                     return self.json(listed())
+                if u.path == "/api/trash":
+                    listing = getattr(store.repository().backend, "list_trash", None)
+                    if listing is None:
+                        return self.json({"error": "This storage backend does not support browsing trash"}, 501)
+                    return self.json(listing())
                 if u.path == "/api/folders":
                     return self.json(library.folders())
                 if u.path == "/api/storage":
@@ -971,6 +978,18 @@ def make_handler(jobs):
                             library.remember(pid, kept)
                             restored.append(pid)
                     return self.json({"papers": listed(), "folders": library.folders(), "restored": restored})
+                if u.path == "/api/trash/delete":
+                    pid = str(body.get("paper", ""))
+                    if not store.valid_id(pid):
+                        return self.json({"error": "Invalid document id"}, 400)
+                    if any(j["pid"] == pid and j["status"] in ("queued", "running") for j in jobs.list()):
+                        return self.json({"error": "busy"}, 409)
+                    remove = getattr(store.repository().backend, "delete_trashed", None)
+                    if remove is None:
+                        return self.json({"error": "This storage backend does not support deleting trash"}, 501)
+                    if not remove(pid):
+                        return self.json({"error": "No such document in trash"}, 404)
+                    return self.json({"deleted": pid})
                 if u.path == "/api/papers/name":
                     pid = str(body.get("paper", ""))
                     if not store.valid_id(pid) or not store.has(pid):

@@ -16,7 +16,7 @@ One model call per chunk (a heading and the units under it).
 import bisect
 import difflib
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import kinds, langs, llm
 from .tokens import is_cjk, lcs_pairs, norm, plain, tokenize_text, words
@@ -720,14 +720,16 @@ def build(doc, cfg, cache_dir, jobs=4, log=print, progress=None, force=False, st
         if stop is not None and stop.is_set():   # stopped: the chunks not yet sent are skipped
             return c, None, llm.Stopped()
         try:
-            return c, llm.call(prompt_for(doc, c), SCHEMA, cfg, cache_dir, force, system=llm.system_for(doc["meta"])), None
+            return c, llm.call(prompt_for(doc, c), SCHEMA, cfg, cache_dir, force, system=llm.system_for(doc["meta"]),
+                               **({"stop": stop} if stop is not None else {})), None
         except Exception as e:  # one failed chunk falls back to local ladders, the rest still build
             return c, None, e
 
     if progress:
         progress(0, len(chunks))
     with ThreadPoolExecutor(jobs) as ex:
-        for n_done, (c, res, err) in enumerate(ex.map(run, chunks), 1):
+        for n_done, future in enumerate(as_completed([ex.submit(run, c) for c in chunks]), 1):
+            c, res, err = future.result()
             if progress:
                 progress(n_done, len(chunks))
             if stop is not None and stop.is_set():

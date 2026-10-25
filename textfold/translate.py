@@ -11,7 +11,7 @@ failed, a paragraph the model left out) is asked for once more, the paragraphs a
 still (gaps) has them asked for the next time its language is generated (fill), the rest kept.
 """
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import kinds, langs, llm
 from .ladder import KIND, align, clean, outline, section_ladder, topic_tokens, written
@@ -181,15 +181,22 @@ def _ask(doc, lang, tasks, cfg, cache_dir, jobs, log, tick, force, stop, again=F
         if stop is not None and stop.is_set():   # stopped: the parts not yet sent are skipped
             return task, None, llm.Stopped()
         try:
-            return task, llm.call(prompt_for(doc, {**c, "units": us}, lang), SCHEMA, cfg, cache_dir, force, system=llm.system_for(doc["meta"])), None
+            return task, llm.call(prompt_for(doc, {**c, "units": us}, lang), SCHEMA, cfg, cache_dir, force, system=llm.system_for(doc["meta"]),
+                                  **({"stop": stop} if stop is not None else {})), None
         except Exception as e:
             return task, None, e
 
     with ThreadPoolExecutor(jobs) as ex:
-        for (c, k, us), res, err in ex.map(run, tasks):
+        futures = {ex.submit(run, task): i for i, task in enumerate(tasks)}
+        completed = {}
+        for future in as_completed(futures):
+            completed[futures[future]] = future.result()
             tick()
             if stop is not None and stop.is_set():
                 raise llm.Stopped()
+        # Keep title/section selection deterministic while reporting actual completions.
+        for i in range(len(tasks)):
+            (c, k, us), res, err = completed[i]
             if err:
                 errors.append(err)
                 log(f"  ! {lang} {c['id']}{f' part {k + 1}' if k else ''}: {err}")

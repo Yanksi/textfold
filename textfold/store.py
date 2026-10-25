@@ -503,10 +503,10 @@ def trash(pid, kept=None):
     return Path(repository().backend.trash(pid, kept))
 
 
-def untrash(pid):
+def untrash(pid, revision=None):
     """A paper deleted last back in the list, as it was (its latest time in papers/.trash), and its place in the
     library as trash kept it ({} when none); None when there is none there, or a paper of that id is listed again."""
-    return repository().backend.restore(pid)
+    return repository().restore(pid, revision)
 
 
 TRASH_DAYS = 30

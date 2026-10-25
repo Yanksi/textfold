@@ -10,6 +10,17 @@ record values and deduplicated binary objects. Uploads verify SHA-256 before a D
 compare-and-swap publishes the complete snapshot. A failed upload or stale save
 cannot replace the previous revision. Listing reads only D1, never original PDFs.
 
+Trash is part of the same document interface. Migration `0004_trash.sql` adds
+terminal permanent deletion and keeps legacy trash restorable after v2 activation.
+Apply migrations before deploying the new Worker; existing records and blobs
+are retained. This migration requires the accompanying Worker, whose inserts
+name their columns and whose writes enforce terminal deletion. Older service
+versions lack the new purge route. Clients require its advertised capability
+and a dedicated endpoint, so an old server cannot silently interpret purge as
+a soft delete.
+See [trash safety and retention](../../docs/trash.md), including protected offline
+recovery and the limits of deleting shared/historical R2 objects.
+
 ## Develop and test
 
 Use Node.js 22+ and the Python project dependencies, including `keyring` and

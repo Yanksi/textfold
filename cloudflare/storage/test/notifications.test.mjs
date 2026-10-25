@@ -80,6 +80,22 @@ test('document, deletion and library commits broadcast committed cursors after h
   } finally { a.close(); b.close(); }
 });
 
+test('permanent deletion notifies only after the terminal snapshot is committed', async () => {
+  const id = 'md-purge-notification';
+  const created = await (await call('v2/documents/' + id, 'PUT', payload([change('meta', { id, title: 'Trash' }), change('source/html', 'Original')]))).json();
+  const trashed = await (await call('v2/documents/' + id, 'PUT', payload([], created.revision, 'trash'))).json();
+  const socket = await connect();
+  try {
+    const changed = nextMessage(socket);
+    const result = await call('v2/documents/' + id + '/purge', 'POST', { ...payload([], trashed.revision, 'deleted'), purge: true });
+    assert.equal(result.status, 200);
+    const hint = await changed;
+    const state = await (await call('v2/documents/' + id)).json();
+    assert.equal(state.purged, true); assert.deepEqual(state.records, {});
+    assert.equal(hint.cursor, (await (await call('v2/health')).json()).cursor);
+  } finally { socket.close(); }
+});
+
 test('clients cannot broadcast application messages or subscribe to another library', async () => {
   const socket = await connect();
   try {

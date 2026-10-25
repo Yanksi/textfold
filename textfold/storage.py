@@ -202,13 +202,30 @@ class LocalDirectoryBackend:
                 DirectoryFiles(target).write("library.json", json.dumps(placement, ensure_ascii=False).encode("utf-8"))
             return str(target)
 
-    def restore(self, document_id):
+    def _trash_revision(self, document_id):
+        root = self.root / "papers" / ".trash"
+        entries = []
+        for folder in sorted(root.glob(f"{checked_id(document_id)}-????????-??????")):
+            # Metadata only. Include every retained incarnation, so a stale
+            # confirmation cannot erase a newly deleted copy of the same ID.
+            entries.append((folder.name, folder.lstat().st_mtime_ns))
+            if not folder.is_symlink() and not getattr(folder, "is_junction", lambda: False)():
+                entries.extend((str(p.relative_to(root)), p.stat().st_mtime_ns, p.stat().st_size)
+                               for p in sorted(folder.rglob("*")) if p.is_file() and not p.is_symlink())
+        return hashlib.sha256(repr(entries).encode()).hexdigest()
+
+    def _check_trash(self, document_id, revision):
+        if revision is not None and revision != self._trash_revision(document_id):
+            raise ConflictError("Trash changed; refresh before trying again")
+
+    def restore(self, document_id, revision=None):
         from .store import valid_id
         if not valid_id(document_id):
             return None
         with self._lock:
+            self._check_trash(document_id, revision)
             folder = self.root / "papers" / document_id
-            if folder.exists():
+            if folder.exists() or folder.is_symlink() or getattr(folder, "is_junction", lambda: False)():
                 return None
             pattern = re.compile(re.escape(document_id) + r"-\d{8}-\d{6}")
             gone = sorted(d for d in (self.root / "papers" / ".trash").glob(f"{document_id}-*")
@@ -243,16 +260,20 @@ class LocalDirectoryBackend:
                     continue
                 identity = match[1]
                 rows[identity] = {"id": identity, "title": meta.get("title") or identity,
-                                  "deleted_at": deleted, "restorable": not (self.root / "papers" / identity).exists()}
+                                  "deleted_at": deleted, "restorable": not (self.root / "papers" / identity).exists(),
+                                  "revision": self._trash_revision(identity), "can_delete": True}
             return sorted(rows.values(), key=lambda row: row["deleted_at"], reverse=True)
 
-    def delete_trashed(self, document_id):
+    def delete_trashed(self, document_id, revision=None):
         """Erase retained copies only; a linked original and an active copy stay intact."""
         from .store import valid_id
         if not valid_id(document_id):
             raise ValueError("Invalid document id")
         with self._lock:
+            self._check_trash(document_id, revision)
             root = self.root / "papers" / ".trash"
+            if root.resolve().parent != (self.root / "papers").resolve():
+                raise ValueError("Trash folder escapes the library")
             pattern = re.compile(re.escape(document_id) + r"-\d{8}-\d{6}")
             removed = False
             for folder in list(root.iterdir()) if root.is_dir() else []:
@@ -280,9 +301,12 @@ class LocalDirectoryBackend:
         with self._lock:
             root = self.root / "papers" / ".trash"
             gone = []
+            if root.resolve().parent != (self.root / "papers").resolve():
+                return gone
             for folder in sorted(root.iterdir()) if root.is_dir() else []:
                 match = re.fullmatch(r"(.+)-(\d{8}-\d{6})", folder.name)
-                if not (match and valid_id(match[1]) and folder.is_dir() and not folder.is_symlink()):
+                if not (match and valid_id(match[1]) and folder.is_dir() and not folder.is_symlink() and
+                        not getattr(folder, "is_junction", lambda: False)()):
                     continue
                 try:
                     at = time.mktime(time.strptime(match[2], "%Y%m%d-%H%M%S"))
@@ -331,6 +355,15 @@ class DocumentStore:
         self.backend = backend
         self.cache_token = object()
         self._sessions = threading.local()
+
+    def list_trash(self):
+        return self.backend.list_trash()
+
+    def restore(self, document_id, revision=None):
+        return self.backend.restore(document_id) if revision is None else self.backend.restore(document_id, revision)
+
+    def delete_trashed(self, document_id, revision=None):
+        return self.backend.delete_trashed(document_id, revision)
 
     def _active(self):
         if not hasattr(self._sessions, "paths"):

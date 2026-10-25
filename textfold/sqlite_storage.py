@@ -71,6 +71,11 @@ class SQLiteBackend:
             db.execute("PRAGMA application_id=1413893188")
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(documents)")}
+            for column, definition in (("purged", "INTEGER NOT NULL DEFAULT 0"), ("purge_base", "TEXT")):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+            db.commit()
 
     def _connect(self):
         db = sqlite3.connect(self.database, timeout=30)
@@ -146,7 +151,7 @@ class SQLiteBackend:
     def list(self):
         with self.transaction() as db:
             return [DocumentInfo(**json.loads(row[0])) for row in db.execute(
-                "SELECT info_json FROM documents WHERE state='active' AND id!=? AND json_type(info_json,'$.meta')!='null' ORDER BY id", (LIBRARY,))]
+                "SELECT info_json FROM documents WHERE state='active' AND purged=0 AND id!=? AND json_type(info_json,'$.meta')!='null' ORDER BY id", (LIBRARY,))]
 
     def write(self, db, identity, values, *, state="active", placement=None, dirty=False, created=None):
         row = db.execute("SELECT * FROM documents WHERE id=?", (identity,)).fetchone()
@@ -245,22 +250,65 @@ class SQLiteBackend:
         self._state(identity, "trash", placement)
         return identity
 
-    def restore(self, identity):
+    def list_trash(self):
+        with self.transaction() as db:
+            rows = db.execute("SELECT d.*, EXISTS(SELECT 1 FROM pending_changes p WHERE p.document_id=d.id) OR EXISTS(SELECT 1 FROM pending_requests p WHERE p.document_id=d.id) AS pending FROM documents d WHERE state='trash' OR (purged=1 AND (loaded=1 OR purge_base IS NOT NULL)) ORDER BY updated DESC").fetchall()
+            return [{"id": row["id"], "title": (json.loads(row["info_json"]).get("meta") or {}).get("title") or row["id"],
+                     "deleted_at": row["updated"], "revision": row["revision"],
+                     "restorable": not row["purged"], "can_delete": not row["purged"] and not row["pending"],
+                     "pending": bool(row["pending"]), "recovery": bool(row["purged"] and not row["purge_base"])} for row in rows]
+
+    def restore(self, identity, revision=None):
         self._identity(identity)
         with self.transaction() as db:
             row = db.execute("SELECT * FROM documents WHERE id=?", (identity,)).fetchone()
             if not row or row["state"] != "trash":
                 return None
+            if revision is not None and revision != row["revision"]:
+                raise ConflictError("Trash changed; refresh before trying again")
+            if row["purged"]:
+                raise ConflictError("This document was permanently deleted")
             placement = json.loads(row["placement"])
             self.write(db, identity, self.values(db, identity), dirty=True, placement=placement)
             return placement
 
-    def purge(self, before):
+    def delete_trashed(self, identity, revision=None):
+        self._identity(identity)
         with self.transaction() as db:
-            rows = db.execute("SELECT id FROM documents WHERE state='trash' AND updated<?", (before,)).fetchall()
-            for row in rows:
-                self.write(db, row[0], self.values(db, row[0]), state="deleted", dirty=True)
-            return [row[0] for row in rows]
+            row = db.execute("SELECT * FROM documents WHERE id=?", (identity,)).fetchone()
+            if not row or row["state"] != "trash":
+                return False
+            if revision is not None and revision != row["revision"]:
+                raise ConflictError("Trash changed; refresh before trying again")
+            pending = db.execute("SELECT 1 FROM pending_changes WHERE document_id=? UNION SELECT 1 FROM pending_requests WHERE document_id=?", (identity, identity)).fetchone()
+            conflict = db.execute("SELECT 1 FROM records WHERE document_id=? AND record_key LIKE 'conflict/%' AND deleted=0", (identity,)).fetchone()
+            if row["purged"] or pending or conflict:
+                raise ConflictError("Pending changes or recovery data are protected; export them from storage settings")
+            if self.tracking:
+                if row["remote_state"] != "trash" or not row["remote_revision"]:
+                    raise ConflictError("Synchronize this document before permanently deleting it")
+                # Retain bytes and outbox until the cloud acknowledges this
+                # exact deletion. A stale confirmation must never be rebased.
+                token, now = str(uuid.uuid4()), time.time()
+                db.execute("UPDATE documents SET state='deleted',purged=1,purge_base=?,revision=?,updated=? WHERE id=?", (row["remote_revision"], token, now, identity))
+                db.execute("INSERT INTO pending_changes VALUES (?,?,?)", (identity, token, now))
+            else:
+                # Non-tracking workspace, checked above to contain no pending
+                # requests, changes or conflicts. Only this trash row is erased.
+                db.execute("DELETE FROM records WHERE document_id=?", (identity,))
+                db.execute("UPDATE documents SET state='deleted',purged=1,loaded=0,revision=?,updated=? WHERE id=?", (str(uuid.uuid4()), time.time(), identity))
+            return True
+
+    def purge(self, before):
+        removed = []
+        for entry in self.list_trash():
+            if entry["deleted_at"] < before and not entry["recovery"]:
+                try:
+                    if self.delete_trashed(entry["id"], entry["revision"]):
+                        removed.append(entry["id"])
+                except ConflictError:
+                    pass  # Never age out pending edits or unresolved conflicts.
+        return removed
 
     def get_library(self):
         with self.transaction() as db:

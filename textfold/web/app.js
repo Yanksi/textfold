@@ -915,9 +915,10 @@
       const rows = await api('/api/trash');
       if (!dlg.open) return;
       list.innerHTML = rows.length ? rows.map((p) => `<div class="trash-row"><div class="trash-document"><b>${esc(p.title)}</b>` +
-        `<span>${esc(p.id)} · ${esc(new Date(p.deleted_at * 1000).toLocaleDateString(I18N.htmlLang(uiLang)))}</span></div>` +
-        `<div class="trash-actions"><button type="button" data-restore="${esc(p.id)}"${p.restorable ? '' : ' disabled'} title="${esc(p.restorable ? T.trash_restore : T.trash_exists)}">${esc(T.trash_restore)}</button>` +
-        `<button type="button" class="trash-delete" data-erase="${esc(p.id)}">${esc(T.trash_delete)}</button></div></div>`).join('')
+        `<span>${esc(p.id)} · ${esc(new Date(p.deleted_at * 1000).toLocaleDateString(I18N.htmlLang(uiLang)))}</span>` +
+        `${p.recovery || p.pending ? `<span>${esc(p.recovery ? T.trash_recovery : T.trash_pending)}</span>` : ''}</div>` +
+        `<div class="trash-actions"><button type="button" data-restore="${esc(p.id)}"${p.restorable ? '' : ' disabled'} title="${esc(p.restorable ? T.trash_restore : p.recovery ? T.trash_recovery : p.pending ? T.trash_pending : T.trash_exists)}">${esc(T.trash_restore)}</button>` +
+        `<button type="button" class="trash-delete" data-erase="${esc(p.id)}"${p.can_delete === false ? ' disabled' : ''} title="${esc(p.can_delete === false ? p.recovery ? T.trash_recovery : T.trash_pending : T.trash_delete)}">${esc(T.trash_delete)}</button></div></div>`).join('')
         : `<p class="trash-empty">${esc(T.trash_empty)}</p>`;
       for (const button of list.querySelectorAll('button')) button.onclick = async () => {
         if (busy) return;
@@ -927,9 +928,9 @@
         busy = true; error.hidden = true;
         list.querySelectorAll('button').forEach((b) => { b.disabled = true; });
         try {
-          if (button.dataset.erase) await api('/api/trash/delete', { paper: pid });
+          if (button.dataset.erase) await api('/api/trash/delete', { paper: pid, revision: paper.revision });
           else {
-            const r = await api('/api/papers/restore', { papers: [pid] });
+            const r = await api('/api/papers/restore', { papers: [pid], revisions: { [pid]: paper.revision } });
             papers = r.papers; folders = r.folders; renderSidebar();
             if (!r.restored.includes(pid)) throw new Error(T.trash_changed);
           }

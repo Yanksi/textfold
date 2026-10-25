@@ -10,7 +10,7 @@ from unittest import mock
 
 from textfold import sync_records as records
 from textfold.cloud_storage import _pack, CloudStorageBackend, StorageError, UnavailableCloudStorage
-from textfold.documents import Document, Source
+from textfold.documents import ConflictError, Document, Source
 from textfold.sqlite_storage import SQLiteBackend
 from textfold.offline_storage import OfflineBackend
 from test_storage import BackendContract
@@ -198,6 +198,57 @@ class SQLiteDocuments(BackendContract, unittest.TestCase):
         self.assertEqual(backend.get(doc.id).revision, before.revision)
         self.assertEqual(backend.status()['pending'], 1)
 
+    def test_trash_schema_upgrade_retains_original_bytes_and_outbox(self):
+        backend = SQLiteBackend(self.root, tracking=True)
+        doc = Document('md-upgrade', meta={'title': 'Old workspace'}, source=Source(pdf=b'Original bytes'))
+        backend.save(doc); backend.trash(doc.id)
+        with backend.transaction() as db:
+            db.execute('ALTER TABLE documents DROP COLUMN purged')
+            db.execute('ALTER TABLE documents DROP COLUMN purge_base')
+        backend = SQLiteBackend(self.root, tracking=True)
+        self.assertEqual(backend.list_trash()[0]['id'], doc.id)
+        with self.assertRaises(ConflictError): backend.delete_trashed(doc.id)
+        self.assertEqual(backend.purge(float('inf')), [])
+        self.assertEqual(backend.restore(doc.id), {})
+        self.assertEqual(backend.get(doc.id).source.pdf, b'Original bytes')
+        with backend.transaction() as db:
+            self.assertIsNotNone(db.execute('SELECT generation FROM pending_changes WHERE document_id=?', (doc.id,)).fetchone())
+
+    def test_sqlite_permanent_delete_preserves_active_and_other_documents(self):
+        first = Document('md-remove', meta={'title': 'Remove'}, source=Source(html='Remove'))
+        other = Document('md-keep', meta={'title': 'Keep'}, source=Source(html='Keep'))
+        self.backend.save(first); self.backend.save(other)
+        self.assertFalse(self.backend.delete_trashed(other.id))
+        self.backend.trash(first.id)
+        with self.assertRaises(ConflictError): self.backend.delete_trashed(first.id, 'stale')
+        entry = self.backend.list_trash()[0]
+        self.assertTrue(self.backend.delete_trashed(first.id, entry['revision']))
+        self.assertEqual(self.backend.list_trash(), [])
+        self.assertEqual(self.backend.get(other.id).source.html, 'Keep')
+        with self.assertRaises(ConflictError): self.backend.save(Document(first.id))
+
+    def test_uncertain_only_recovery_export_keeps_local_records_and_attachments(self):
+        import io
+        import zipfile
+        remote = UnavailableCloudStorage({}, 'Offline fixture')
+        backend = OfflineBackend(self.root, remote)
+        doc = Document('md-uncertain', meta={'title': 'Recovery'}, source=Source(pdf=b'Protected original'),
+                       notes={'notes': [{'id': 'n-one', 'text': 'Protected edit', 'anchor': {}}]})
+        backend.save(doc)
+        with backend.cache.transaction() as db:
+            values = backend.cache.values(db, doc.id)
+            generation = db.execute('SELECT generation FROM pending_changes WHERE document_id=?', (doc.id,)).fetchone()[0]
+            db.execute('INSERT INTO pending_requests VALUES (?,?,?,?,?,?,?)',
+                       (doc.id, 'uncertain-operation', '{}', records.canonical(values), generation, '{}', 'active'))
+            # Exercise a recovered older outbox with only its uncertain request.
+            db.execute('DELETE FROM pending_changes WHERE document_id=?', (doc.id,))
+        backend._accept_purge(doc.id, {'revision': str(uuid.uuid4()), 'purged': True})
+        backend.clear_cache()
+        with zipfile.ZipFile(io.BytesIO(backend.export_pending())) as archive:
+            self.assertIn('Protected edit', archive.read('pending.json').decode())
+            self.assertIn(b'Protected original', [archive.read(name) for name in archive.namelist() if name.startswith('blobs/')])
+        self.assertEqual(backend.status()['pending'], 1)
+
 
 class ConflictResolution(unittest.TestCase):
     def test_old_delete_conflict_retains_later_text_and_message_branches(self):
@@ -319,6 +370,146 @@ class OfflineDevices(unittest.TestCase):
         self.sync(self.a)
         self.sync(self.b)
         self.b.get(self.identity)
+
+    def trash_entry(self, device):
+        return next(row for row in device.list_trash() if row['id'] == self.identity)
+
+    def test_permanent_deletion_requires_clean_trash_and_is_terminal_across_restart(self):
+        self.seed()
+        self.assertFalse(self.a.delete_trashed(self.identity))
+        self.a.trash(self.identity, {'of': 'folder'})
+        with self.assertRaises(ConflictError):
+            self.a.delete_trashed(self.identity)
+        self.sync(self.a); self.sync(self.b)
+        self.assertEqual(self.trash_entry(self.b)['title'], 'Offline')
+        self.assertTrue(self.a.delete_trashed(self.identity, self.trash_entry(self.a)['revision']))
+        self.assertFalse(self.trash_entry(self.a)['restorable'])
+        self.a = self.device('a')
+        self.sync(self.a); self.sync(self.b)
+        self.assertFalse(any(row['id'] == self.identity for row in self.a.list_trash()))
+        state = self.a.remote.sync_snapshot(self.identity)
+        self.assertTrue(state['purged']); self.assertEqual(state['records'], {})
+        self.assertIsNone(self.b.restore(self.identity))
+        with self.assertRaises(ConflictError):
+            self.b.remote.sync_commit(self.identity, {'operation_id': str(uuid.uuid4()), 'revision': state['revision'],
+                                                      'changes': [], 'state': 'active', 'placement': {}})
+        self.a.clear_cache(); self.b.clear_cache()
+        with self.assertRaises(FileNotFoundError): self.b.get(self.identity)
+
+    def test_remote_purge_keeps_offline_notes_uncertain_requests_and_export(self):
+        import io
+        import zipfile
+        self.seed()
+        doc = self.b.get(self.identity)
+        doc.notes['notes'][0]['text'] = 'Keep my offline work'
+        self.b.save(doc)
+        with self.b.cache.transaction() as db:
+            pending = db.execute('SELECT generation FROM pending_changes WHERE document_id=?', (self.identity,)).fetchone()[0]
+            snapshot = self.b.cache.values(db, self.identity)
+            operation = str(uuid.uuid4())
+            payload = {'operation_id': operation, 'revision': 'old', 'changes': [], 'state': 'active', 'placement': {}}
+            db.execute('INSERT INTO pending_requests VALUES (?,?,?,?,?,?,?)', (self.identity, operation, records.canonical(payload), records.canonical(snapshot), pending, records.canonical(snapshot), 'active'))
+        self.a.trash(self.identity); self.sync(self.a)
+        self.a.delete_trashed(self.identity, self.trash_entry(self.a)['revision']); self.sync(self.a)
+        self.b = self.device('b')
+        with mock.patch.object(self.b.remote, 'sync_commit', wraps=self.b.remote.sync_commit) as commit:
+            status = self.b.sync()
+        commit.assert_not_called()
+        self.assertGreater(status['pending'], 0)
+        self.assertTrue(self.trash_entry(self.b)['recovery'])
+        self.assertFalse(self.trash_entry(self.b)['can_delete'])
+        self.b.clear_cache()
+        self.assertEqual(self.b.purge(float('inf')), [])
+        with zipfile.ZipFile(io.BytesIO(self.b.export_pending())) as archive:
+            data = archive.read('pending.json').decode()
+            self.assertIn('Keep my offline work', data)
+            self.assertIn(operation, data)
+            self.assertEqual(archive.read('blobs/' + next(iter(blob for blob in archive.namelist() if blob.startswith('blobs/'))).split('/')[-1]), self.doc.source.pdf)
+        with self.b.cache.transaction() as db:
+            self.assertEqual(db.execute('SELECT operation_id FROM pending_requests WHERE document_id=?', (self.identity,)).fetchone()[0], operation)
+        self.assertTrue(self.b.remote.sync_snapshot(self.identity)['purged'])
+
+    def test_lost_purge_ack_replays_after_restart_without_recovery_or_resurrection(self):
+        self.seed(); self.a.trash(self.identity); self.sync(self.a)
+        self.a.delete_trashed(self.identity, self.trash_entry(self.a)['revision'])
+        commit = self.a.remote.sync_commit
+        def lose_ack(identity, payload):
+            commit(identity, payload)
+            raise StorageError('Lost purge acknowledgement')
+        with mock.patch.object(self.a.remote, 'sync_commit', side_effect=lose_ack):
+            self.assertIn('Lost purge', self.a.sync()['error'])
+        self.a = self.device('a')
+        self.sync(self.a)
+        self.assertFalse(any(row['id'] == self.identity for row in self.a.list_trash()))
+        with self.a.cache.transaction() as db:
+            self.assertFalse(db.execute('SELECT 1 FROM records WHERE document_id=?', (self.identity,)).fetchone())
+
+    def test_concurrent_restore_cancels_queued_permanent_delete(self):
+        self.seed(); self.a.trash(self.identity); self.sync(self.a); self.sync(self.b)
+        self.a.delete_trashed(self.identity, self.trash_entry(self.a)['revision'])
+        self.assertIsNotNone(self.b.restore(self.identity)); self.sync(self.b)
+        status = self.a.sync()
+        self.assertIn('cancelled', status['error'])
+        self.sync(self.a)
+        self.assertEqual(self.a.get(self.identity).source.pdf, self.doc.source.pdf)
+        self.assertFalse(self.a.remote.sync_snapshot(self.identity)['purged'])
+
+    def test_permanent_delete_checks_service_capability_and_stale_local_revision(self):
+        self.seed(); self.a.trash(self.identity); self.sync(self.a)
+        entry = self.trash_entry(self.a)
+        with mock.patch.object(self.a.remote, 'sync_health', return_value={'format': 'textfold/storage-v2', 'library_id': self.a.remote.sync_health()['library_id'], 'cursor': self.a.remote.sync_health()['cursor']}):
+            with self.assertRaises(StorageError): self.a.delete_trashed(self.identity)
+        with self.assertRaises(ConflictError): self.a.delete_trashed(self.identity, 'stale')
+        with mock.patch.object(self.a.remote, 'sync_health', side_effect=StorageError('offline')):
+            with self.assertRaises(StorageError): self.a.delete_trashed(self.identity, entry['revision'])
+        self.assertEqual(self.trash_entry(self.a)['revision'], entry['revision'])
+
+    def test_purge_during_generation_keeps_checkpoints_and_paid_replies_for_export(self):
+        import io
+        import zipfile
+        self.seed()
+        lease = self.b.defer_sync(self.identity)
+        lease.__enter__()
+        try:
+            doc = self.b.get(self.identity)
+            self.a.trash(self.identity); self.sync(self.a)
+            self.a.delete_trashed(self.identity, self.trash_entry(self.a)['revision']); self.sync(self.a)
+            self.b.sync()  # observes terminal identity while the lease is held
+            doc.processing.replies['paid-answer'] = b'Paid model output'
+            self.b.save(doc)
+        finally:
+            lease.__exit__(None, None, None)
+        self.b = self.device('b')
+        self.assertGreater(self.b.sync()['pending'], 0)
+        self.b.clear_cache()
+        with zipfile.ZipFile(io.BytesIO(self.b.export_pending())) as archive:
+            self.assertIn('paid-answer', archive.read('pending.json').decode())
+            self.assertIn(b'Paid model output', [archive.read(name) for name in archive.namelist() if name.startswith('blobs/')])
+        self.assertTrue(self.b.remote.sync_snapshot(self.identity)['purged'])
+
+    def test_cloud_transport_trash_interface_and_metadata_listing(self):
+        self.seed(); self.a.trash(self.identity); self.sync(self.a)
+        remote = self.a.remote
+        with mock.patch.object(remote, '_download', side_effect=AssertionError('Listing loaded a blob')):
+            entry = next(row for row in remote.list_trash() if row['id'] == self.identity)
+        self.assertEqual(remote.restore(self.identity, entry['revision']), {})
+        self.sync(self.a)
+        self.a.trash(self.identity); self.sync(self.a)
+        entry = next(row for row in remote.list_trash() if row['id'] == self.identity)
+        self.assertTrue(remote.delete_trashed(self.identity, entry['revision']))
+        self.sync(self.a); self.sync(self.b)
+        self.assertTrue(remote.sync_snapshot(self.identity)['purged'])
+
+    def test_uncached_trash_purge_is_durable_without_downloading_original(self):
+        self.seed(); self.a.trash(self.identity); self.sync(self.a); self.sync(self.b)
+        self.b.clear_cache(); self.b = self.device('b')
+        entry = self.trash_entry(self.b)
+        with mock.patch.object(self.b.remote, '_download', side_effect=AssertionError('Purge downloaded a blob')):
+            self.assertTrue(self.b.delete_trashed(self.identity, entry['revision']))
+            self.assertEqual(self.trash_entry(self.b)['title'], 'Offline')
+            self.b = self.device('b')
+            self.sync(self.b)
+        self.assertTrue(self.b.remote.sync_snapshot(self.identity)['purged'])
 
     def test_offline_edit_restart_and_two_device_independent_merge(self):
         self.seed()

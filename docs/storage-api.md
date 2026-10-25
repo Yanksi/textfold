@@ -139,8 +139,34 @@ Documents; the generic storage adapter owns record reconciliation.
 | `GET /v2/changes?cursor=<integer>` | `{changes: [{sequence, document_id, revision, state}], cursor, more}` |
 | `GET /v2/documents/<id>` | `{records, revision, state, placement, info}` |
 | `PUT /v2/documents/<id>` | Apply one atomic sparse record commit; return `{revision, state, info}` |
+| `POST /v2/documents/<id>/purge` | Permanently delete a confirmed trash revision; terminal tombstone |
 | `GET /v2/library` | Same snapshot envelope for the reserved organization document |
 | `PUT /v2/library` | Same atomic commit for organization records |
+
+### Trash and permanent deletion
+
+Services supporting permanent deletion advertise `trash_purge: 1` in health.
+Index rows and snapshots include `purged: boolean` (missing means false).
+Trashed documents use the existing `state: "trash"` sparse commit, with library
+placement retained; restoring commits `state: "active"` against that revision.
+Legacy trash is indexed too, unless an active same-ID document exists.
+
+The purge endpoint accepts `{operation_id, revision, state: "deleted", changes:
+[], placement: {}, purge: true}`. It requires the exact current trash revision,
+applies the same operation replay/hash rules, and returns `{revision, state,
+info, purged: true}`. In one transaction it removes records and legacy trash
+rows, records the idempotent operation, and appends a normal deleted feed event.
+Subsequent snapshots have `records: {}`, `purged: true`, and the confirming
+`operation_id`; permanent tombstones remain in the index. Every future write
+to that identity is rejected, including restore/recreate with the newest token.
+Replay of the original successful operation still returns its saved result.
+Failed CAS publishes nothing. Notifications are sent only after commit.
+
+A separate endpoint ensures older servers reject the request instead of
+silently treating it as soft deletion. Clients retain their local outbox until
+the purge is confirmed and quarantine other devices' unsent work for explicit
+recovery/export; they never merge it back into this identity. See
+[trash.md](trash.md) for storage/retention and shared-object limitations.
 
 ### Optional change notifications
 

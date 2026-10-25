@@ -155,6 +155,8 @@ class CloudStorageBackend:
 
     def sync_commit(self, document_id, payload):
         path = "library" if document_id == "@library" else self._path(document_id)
+        if payload.get("purge") is True:
+            return self._request("POST", path + "/purge", payload, version="v2")
         return self._request("PUT", path, payload, version="v2")
 
     def sync_changes(self, cursor):
@@ -218,8 +220,37 @@ class CloudStorageBackend:
         return self._request("POST", self._path(document_id) + "/trash",
                              {"commit": str(uuid.uuid4()), "placement": placement})["token"]
 
-    def restore(self, document_id):
-        return self._request("POST", self._path(document_id) + "/restore", {})["placement"]
+    def list_trash(self):
+        return [{"id": row["id"], "title": (row["info"].get("meta") or {}).get("title") or row["id"],
+                 "deleted_at": row["info"].get("updated", 0), "revision": row["revision"],
+                 "restorable": True, "can_delete": True}
+                for row in self.sync_index() if row["state"] == "trash" and not row.get("purged")]
+
+    def restore(self, document_id, revision=None):
+        if revision is None and not self.sync_health().get("sync_enabled"):
+            return self._request("POST", self._path(document_id) + "/restore", {})["placement"]
+        value = self.sync_snapshot(document_id)
+        if value["state"] != "trash" or value.get("purged"):
+            return None
+        if revision is not None and value["revision"] != revision:
+            raise ConflictError("Trash changed; refresh before trying again")
+        self.sync_commit(document_id, {"operation_id": str(uuid.uuid4()), "revision": value["revision"],
+                                      "changes": [], "state": "active", "placement": value["placement"]})
+        return value["placement"]
+
+    def delete_trashed(self, document_id, revision=None):
+        if self.sync_health().get("trash_purge") != 1:
+            raise StorageError("Upgrade the storage service before permanently deleting documents")
+        value = self.sync_snapshot(document_id)
+        if value["state"] != "trash" or value.get("purged"):
+            return False
+        if revision is not None and value["revision"] != revision:
+            raise ConflictError("Trash changed; refresh before trying again")
+        result = self.sync_commit(document_id, {"operation_id": str(uuid.uuid4()), "revision": value["revision"],
+                                               "changes": [], "state": "deleted", "placement": {}, "purge": True})
+        if result.get("purged") is not True:
+            raise StorageError("The service did not confirm permanent deletion")
+        return True
 
     def purge(self, before):
         return self._request("POST", "trash/purge", {"before": before})["removed"]

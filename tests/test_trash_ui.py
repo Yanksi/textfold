@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from textfold.storage import LocalDirectoryBackend
-from textfold.documents import Document, Source
+from textfold.documents import ConflictError, Document, Source
 
 
 class TrashStorage(unittest.TestCase):
@@ -72,6 +72,18 @@ class TrashStorage(unittest.TestCase):
         self.assertFalse(self.backend.delete_trashed(self.doc.id))
         self.assertTrue(malformed.exists())
 
+    def test_stale_confirmation_preserves_changed_trash(self):
+        folder = Path(self.backend.trash(self.doc.id))
+        token = self.backend.list_trash()[0]['revision']
+        (folder/'notes.json').write_text('{"notes":[{"text":"New work"}]}', encoding='utf-8')
+        for action in (self.backend.restore, self.backend.delete_trashed):
+            with self.assertRaises(ConflictError):
+                action(self.doc.id, token)
+        self.assertTrue(folder.exists())
+        current = self.backend.list_trash()[0]['revision']
+        self.assertEqual(self.backend.restore(self.doc.id, current), {})
+        self.assertEqual(self.backend.get(self.doc.id).notes['notes'][0]['text'], 'New work')
+
     def test_deleting_a_linked_entry_keeps_external_original(self):
         external = self.root/'external'; external.mkdir()
         (external/'meta.json').write_text(json.dumps({'title':'External'}),encoding='utf-8')
@@ -88,6 +100,20 @@ class TrashStorage(unittest.TestCase):
         self.assertFalse(link.is_symlink())
         self.assertEqual((external/'source.html').read_text(encoding='utf-8'),'Keep external')
 
+    def test_redirected_trash_root_never_deletes_an_external_directory(self):
+        external = self.root/'external-trash'; external.mkdir()
+        entry = external/f'{self.doc.id}-20261001-010101'; entry.mkdir()
+        (entry/'meta.json').write_text('{"title":"Keep"}', encoding='utf-8')
+        link = self.backend.root/'papers/.trash'
+        try: link.symlink_to(external, target_is_directory=True)
+        except OSError as error:
+            if os.name != 'nt': self.skipTest(str(error))
+            made = subprocess.run(['cmd','/c','mklink','/J',str(link),str(external)],capture_output=True)
+            if made.returncode: self.skipTest('Directory links unavailable')
+        with self.assertRaises(ValueError): self.backend.delete_trashed(self.doc.id)
+        self.assertEqual(self.backend.purge(float('inf')), [])
+        self.assertTrue((entry/'meta.json').exists())
+
 
 class TrashRoutes(unittest.TestCase):
     from test_storage_routes import StorageRoutes as _routes
@@ -103,6 +129,9 @@ class TrashRoutes(unittest.TestCase):
         status, rows = self.call('/api/trash')
         self.assertEqual(status,200)
         self.assertEqual(rows[0]['id'],pid)
+        self.assertEqual(self.call('/api/trash/delete',{'paper':pid,'revision':'stale'})[0],409)
+        self.assertEqual(self.call('/api/papers/restore',{'papers':[pid],'revisions':{pid:'stale'}})[0],409)
+        self.assertEqual(self.call('/api/trash')[1][0]['id'],pid)
         self.assertEqual(self.call('/api/papers/restore',{'papers':[pid]})[1]['restored'],[pid])
         self.assertEqual(source.read_bytes(),original)
         self.call('/api/papers/delete',{'papers':[pid]})

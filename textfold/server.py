@@ -674,10 +674,7 @@ def make_handler(jobs):
                 if u.path == "/api/papers":
                     return self.json(listed())
                 if u.path == "/api/trash":
-                    listing = getattr(store.repository().backend, "list_trash", None)
-                    if listing is None:
-                        return self.json({"error": "This storage backend does not support browsing trash"}, 501)
-                    return self.json(listing())
+                    return self.json(store.repository().list_trash())
                 if u.path == "/api/folders":
                     return self.json(library.folders())
                 if u.path == "/api/storage":
@@ -973,7 +970,7 @@ def make_handler(jobs):
                     pids = body.get("papers") if isinstance(body.get("papers"), list) else []
                     restored = []
                     for pid in dict.fromkeys(str(p) for p in pids):
-                        kept = store.untrash(pid)
+                        kept = store.untrash(pid, (body.get("revisions") or {}).get(pid))
                         if kept is not None:
                             library.remember(pid, kept)
                             restored.append(pid)
@@ -984,10 +981,7 @@ def make_handler(jobs):
                         return self.json({"error": "Invalid document id"}, 400)
                     if any(j["pid"] == pid and j["status"] in ("queued", "running") for j in jobs.list()):
                         return self.json({"error": "busy"}, 409)
-                    remove = getattr(store.repository().backend, "delete_trashed", None)
-                    if remove is None:
-                        return self.json({"error": "This storage backend does not support deleting trash"}, 501)
-                    if not remove(pid):
+                    if not store.repository().delete_trashed(pid, body.get("revision")):
                         return self.json({"error": "No such document in trash"}, 404)
                     return self.json({"deleted": pid})
                 if u.path == "/api/papers/name":
@@ -1102,6 +1096,8 @@ def make_handler(jobs):
                     except Exception as e:
                         return self.json({"ok": False, "error": str(e)[:600]})
                 self.json({"error": "not found"}, 404)
+            except ConflictError as e:
+                self.json({"error": str(e)}, 409)
             except Exception as e:
                 self.json({"error": str(e)}, 500)
 

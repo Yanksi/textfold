@@ -1,6 +1,8 @@
 """Document repositories. File layout and parser workspaces stay internal."""
 import contextlib
+import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -14,7 +16,10 @@ from ._storage_layout import DirectoryFiles, LegacyLayout, checked_id, checked_k
 
 
 def document_info(doc):
-    base = (doc.layers.get("en") or {}).get("lang") or "en"   # (the ladder's own language: store.text_lang)
+    from . import langs, store
+    base = (doc.layers.get("en") or {}).get("lang")
+    if base not in langs.LANGS:
+        base = store._detect(doc.source.html or "")
     translated = sorted(k[3:] for k in doc.layers if k.startswith("tr-"))
     languages = list(dict.fromkeys(([base] if "en" in doc.layers else []) + translated))
     titles = {k[3:]: v["title"] for k, v in doc.layers.items() if k.startswith("tr-") and v.get("title")}
@@ -36,6 +41,52 @@ class LocalDirectoryBackend:
         self._files = DirectoryFiles(self.root)
         with _locks_guard:
             self._lock = _locks.setdefault(self.root, threading.RLock())
+        with self._lock:
+            self._recover()
+
+    @staticmethod
+    def _fingerprint(raw):
+        digest = hashlib.sha256()
+        for key, value in sorted(raw.items()):
+            digest.update(key.encode("utf-8") + b"\0")
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+        return digest.hexdigest()
+
+    def _recover(self):
+        """Recover only our journaled swaps, never unrelated hidden folders."""
+        from .storage_settings import _process_alive
+        papers = self._files.path("papers")
+        for stage in papers.glob(".document-*"):
+            if stage.is_symlink() or getattr(stage, "is_junction", lambda: False)():
+                continue
+            try:
+                journal = json.loads((stage / "transaction.json").read_text(encoding="utf-8"))
+                if not isinstance(journal, dict) or journal.get("format") != "textfold/document-save":
+                    continue
+                folder = self._path(journal["id"])
+                owner = journal["pid"]
+                if owner != os.getpid() and _process_alive(owner):
+                    continue
+                ready, backup = stage / "ready", stage / "backup"
+                if any(p.is_symlink() or getattr(p, "is_junction", lambda: False)() for p in (ready, backup)):
+                    continue
+                if not folder.exists() and backup.is_dir():
+                    rename_directory(backup, folder)
+                elif not folder.exists() and journal.get("new") and ready.is_dir():
+                    if self._fingerprint(LegacyLayout.read_folder(ready)) != journal["digest"]:
+                        continue
+                    rename_directory(ready, folder)
+                elif backup.exists():
+                    # Another writer may have recreated this ID. Keep the
+                    # backup unless this is exactly the published candidate.
+                    if self._fingerprint(LegacyLayout.read_folder(folder)) != journal["digest"]:
+                        continue
+                if folder.exists():
+                    shutil.rmtree(stage)
+            except (OSError, ValueError, KeyError, TypeError):
+                # An unavailable/ambiguous backup remains recoverable on disk.
+                continue
 
     def _path(self, identity):
         return self._files.path("papers/" + checked_id(identity))
@@ -404,5 +455,5 @@ class DocumentStore:
         if identity in self._active():
             return self._active()[identity].folder
         if isinstance(self.backend, LocalDirectoryBackend):
-            return self.backend._path(identity)
+            return self.backend.root / "papers" / identity
         raise RuntimeError("A local document path requires a document workspace")

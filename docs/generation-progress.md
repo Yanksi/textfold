@@ -19,6 +19,22 @@ Rate-limit errors are not retried as reasoning-effort fallback requests. These
 changes reduce contention; they cannot remove provider-side rate limits or
 guarantee that another application's requests will not be throttled.
 
+Codex reasoning levels come from the selected model's `model/list` capabilities.
+`off` selects its lowest advertised level directly: `none` or `minimal` only if
+supported, otherwise (for example) `low`. Supported explicit levels are kept;
+an unavailable explicit level chooses the nearest supported lower level, or the
+minimum if no lower level exists. Missing capabilities leave `off` to the CLI
+default rather than probing with an assumed `none` request. Unrecognized future
+levels use the advertised default or first supported option.
+
+This mapping happens only when constructing CLI arguments. The original model
+specification, prompt, schema, logical effort and cache-key calculation are
+unchanged. Existing completed chapter replies remain cache hits, including
+replies previously obtained through the `off` → `low` fallback. Cache reads do
+not invoke model discovery or a model subprocess. A mixed cached/unfinished
+generation requests only the unfinished chapter; explicit force regeneration
+retains its existing cache-bypass meaning.
+
 The regression suite uses stand-in model replies and disposable Python child
 processes, never a real Codex/bridge process. It checks slow-section completion,
 translation progress, environment isolation, queued cancellation, timeout and

@@ -668,6 +668,34 @@ def parse_json(text, schema=None):
 _CODEX_CALL = threading.Lock()   # one owned request; do not flood the reader's shared account
 
 
+def _codex_effort(model, effort):
+    """Translate the request only at dispatch, leaving llm.call's cache key intact.
+
+    Discovery already asked model/list. Do not probe with paid failing requests
+    or assume every Codex model accepts the same reasoning levels.
+    """
+    if effort in (None, "default"):
+        return None
+    agent = next((a for a in STATE["agents"] if a["runtime"] == "codex" and a.get("runnable")), {})
+    row = next((m for m in agent.get("models", []) if m.get("model") == model), None)
+    if row is None:
+        return None if effort == "off" else effort  # unknown model: defer to CLI defaults for off
+    levels = [level for level in row.get("efforts", []) if isinstance(level, str) and level]
+    if not levels:
+        return None
+    if effort in levels:
+        return effort
+    order = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+    supported = [level for level in order if level in levels]
+    if supported:
+        if effort == "off":
+            return supported[0]
+        if effort in order:
+            lower = [level for level in supported if order.index(level) <= order.index(effort)]
+            return lower[-1] if lower else supported[0]
+    return row.get("defaultEffort") if row.get("defaultEffort") in levels else levels[0]
+
+
 def run_codex(model, prompt, schema, system, effort, timeout, tools=False, stop=None):
     from .llm import Stopped
     while not _CODEX_CALL.acquire(timeout=.2):
@@ -689,20 +717,15 @@ def _codex(model, prompt, schema, system, effort, timeout, tools, stop):
         # (tools: its web search too; the sandbox stays read-only)
         args = [*argv(path), *(["--search"] if tools else []), "exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only",
                 "-m", model, "--output-schema", str(sf), "-o", str(of)]
-        # off is "none" (gpt-5.5 takes it, and refuses "minimal"); a model that refuses "none" runs at "low"
-        for level in (["none", "low"] if effort == "off" else [effort]):
-            call = args + (["-c", f"model_reasoning_effort={level}"] if level else []) + ["-"]
-            options = dict(input=f"{system}\n\n{prompt}", text=True, encoding="utf-8", errors="replace",
-                           timeout=timeout, env=child_env(), cwd=tmp)
-            if stop is None:
-                r = subprocess.run(call, capture_output=True, **options)
-            else:
-                from ._agent_process import run
-                r = run(call, stop=stop, **options)
-            if not r.returncode and of.exists():
-                break
-            if re.search(r"\b429\b|too many requests|rate.limit", (r.stderr or "") + (r.stdout or ""), re.I):
-                break   # changing reasoning effort cannot repair a throttled account
+        level = _codex_effort(model, effort)
+        call = args + (["-c", f"model_reasoning_effort={level}"] if level else []) + ["-"]
+        options = dict(input=f"{system}\n\n{prompt}", text=True, encoding="utf-8", errors="replace",
+                       timeout=timeout, env=child_env(), cwd=tmp)
+        if stop is None:
+            r = subprocess.run(call, capture_output=True, **options)
+        else:
+            from ._agent_process import run
+            r = run(call, stop=stop, **options)
         if r.returncode or not of.exists():
             raise RuntimeError(f"codex exec exited {r.returncode}: {(r.stderr or r.stdout)[-800:]}")
         return parse_json(of.read_text(encoding="utf-8")), None

@@ -878,7 +878,8 @@
     : msg === 'no-readme' ? t().no_readme : msg === 'github-limit' ? t().github_limit : msg === 'needs-engine' ? t().pdf_needs
     : msg === 'busy' ? t().engine_busy : msg === 'not-pdf' ? t().not_pdf : msg === 'too-large' ? t().pdf_large
     : msg === 'bad-file' ? t().file_bad : msg === 'no-file' ? t().no_file : msg === 'not-running' ? t().z_off : msg === 'api-off' ? t().z_api_off
-    : msg === 'web-notext' ? t().web_notext : msg === 'web-pdf' ? t().web_pdf : msg === 'web-blocked' ? t().web_blocked : msg);
+    : msg === 'web-notext' ? t().web_notext : msg === 'web-pdf' ? t().web_pdf : msg === 'web-blocked' ? t().web_blocked
+    : /^net-down:/.test(msg) ? t().net_down.replace('{host}', msg.slice(9) || '?') : msg);   // (fetch.Unreachable)
 
   // the corner where the page says what is under way, one above the other: a generation, the app's update. Each toast
   // is a small card: a sign at the left, what happens beside it, then its line, its progress or its buttons below.
@@ -895,6 +896,26 @@
   const svg = (k) => `<svg viewBox="0 0 20 20" aria-hidden="true">${SIGN[k]}</svg>`;
   const sign = (k, tone) => `<span class="g-ico${tone ? ` ${tone}` : ''}">${k === 'mark' ? MARK : svg(k)}</span>`;
   const shut = (label) => `<button type="button" class="g-x" aria-label="${esc(label)}" title="${esc(label)}">${svg('x')}</button>`;
+
+  // a file dragged over the page, for as long as it is: `on` when it comes, `off` when it leaves the window, is
+  // dropped, or stops coming by (dragover comes every few hundred milliseconds while it is here). Not a count of
+  // dragenter against dragleave: an element drawn again under the pointer (a paragraph, a job's card, the toast that
+  // says drop it here) takes its dragleave with it, the count never came back to 0, and "Drop it here" stayed.
+  function whileDragged(on, off) {
+    let here = false, gone = 0;
+    const files = (e) => [...((e.dataTransfer && e.dataTransfer.types) || [])].includes('Files');
+    const leave = () => { clearTimeout(gone); if (here) { here = false; off(); } };
+    const come = (e) => {
+      if (!files(e)) return;
+      if (e.type === 'dragover') e.preventDefault();   // (so it can be dropped here)
+      if (!here) { here = true; on(); }
+      clearTimeout(gone); gone = setTimeout(leave, 1000);
+    };
+    document.addEventListener('dragenter', come);
+    document.addEventListener('dragover', come);
+    document.addEventListener('dragleave', (e) => { if (here && !e.relatedTarget) { clearTimeout(gone); gone = setTimeout(leave, 50); } });   // (out of the window)
+    addEventListener('drop', leave, true);   // (first: the page's own drop then says what comes of it)
+  }
 
   // ── a delete's Undo: for ten seconds the corner says what went, with a button that brings it back as it was (in
   //    its folder, under its name); the paper being read, deleted, is offered back on the page it goes to ──
@@ -967,16 +988,14 @@
   if (PAPER) {
     const toast = h('div', 'gen-toast'); toast.hidden = true; toasts.append(toast);
     // a Markdown file dropped on a paper's page: stored, then generated from the landing (?start=)
-    let over = 0;
-    const hasFile = (e) => [...((e.dataTransfer && e.dataTransfer.types) || [])].includes('Files');
     const say = (msg, ms) => {   // (ms: a message that goes by itself, which says what went wrong)
       toast.hidden = false;
-      toast.innerHTML = `${ms ? sign('warn', 'warn') : sign(msg === t().drop_md ? 'down' : 'mark')}<b>${esc(msg)}</b>`;
+      toast.innerHTML = `${ms ? sign('warn', 'warn') : sign('mark')}<b>${esc(msg)}</b>`;
       if (ms) setTimeout(() => { toast.hidden = true; }, ms);
     };
-    document.addEventListener('dragenter', (e) => { if (hasFile(e)) { over++; say(t().drop_md); } });
-    document.addEventListener('dragleave', () => { if (--over <= 0) { over = 0; if (toast.textContent === t().drop_md) toast.hidden = true; } });
-    document.addEventListener('dragover', (e) => { if (hasFile(e)) e.preventDefault(); });
+    // "Drop it here" in a toast of its own, below a generation's, which it leaves as it is
+    const hint = h('div', 'gen-toast drop-toast'); hint.hidden = true; toasts.append(hint);
+    whileDragged(() => { hint.innerHTML = `${sign('down')}<b>${esc(t().drop_md)}</b>`; hint.hidden = false; }, () => { hint.hidden = true; });
     // several dropped here: they go in from this page, which stays open, and the toast says what came of them
     async function dropFiles(files) {
       const T = t();
@@ -997,7 +1016,7 @@
     }
     document.addEventListener('drop', async (e) => {
       if (!e.dataTransfer.files.length) return;
-      e.preventDefault(); over = 0;
+      e.preventDefault();
       if (e.dataTransfer.files.length > 1) { dropFiles([...e.dataTransfer.files]); return; }
       const file = e.dataTransfer.files[0];
       if (forEngine(file)) {
@@ -1205,7 +1224,13 @@
         const T = t(), name = esc(label || jobName(j, T)), in_ = j.lang ? ` · ${esc(nameOf(j.lang))}` : '';
         if (j.status === 'moved' && j.next) { watchers.set(j.next, cb); startPolling(); return; }   // (an arXiv paper without HTML: its PDF converts)
         if (j.status === 'error' && j.error === 'needs-engine') { engineCard(j.upload, label || j.title || j.pid); return; }
-        if (j.status === 'error') { card.innerHTML = `<div class="jc-t">${esc(T.failed)} · ${name}</div><div class="jc-e">${esc(errText(j.error))}</div>`; return; }
+        if (j.status === 'error') {   // the network failed on the way: continued from there, what came is kept (fetch.py)
+          const again = j.kind === 'generate' && j.pid && /^net-down:/.test(j.error || '');
+          card.innerHTML = `<div class="jc-head"><div class="jc-t">${esc(T.failed)} · ${name}</div>${again ? `<button type="button" class="jc-go">${esc(T.resume)}</button>` : ''}</div>
+            <div class="jc-e">${esc(errText(j.error))}</div>`;
+          if (again) card.querySelector('.jc-go').onclick = () => start(j.pid, label || j.title, j.lang);
+          return;
+        }
         if (j.status === 'stopped') {
           card.innerHTML = `<div class="jc-head"><div class="jc-t">${name}${in_}</div>${j.kind === 'generate' ? `<button type="button" class="jc-go">${esc(T.resume)}</button>` : ''}</div>
             <div class="jc-s">${esc(T.stopped)}</div>`;
@@ -1228,7 +1253,8 @@
       card.hidden = false;
       try {
         await submit(ref, lang, false, onCard(label, mine));
-      } catch (x) { card.hidden = true; fail(errText(x.message)); }
+        return true;
+      } catch (x) { card.hidden = true; fail(errText(x.message)); return false; }
     }
     // a file that needs the engine: what it is and what it takes, and its install, in the card; once installed, the
     // file waiting for it converts (the server starts that), and the card follows the conversion
@@ -1293,10 +1319,12 @@
     form.onsubmit = async (e) => {
       e.preventDefault();
       err.hidden = true;
-      const ref = document.getElementById('ref').value.trim();
+      const input = document.getElementById('ref'), ref = input.value.trim();
       if (!/\d{4}\.\d{4,5}|PMC\d{4,}|PPR\d{4,}|10\.\d{4,9}\/\S|^https?:\/\/[^\s/]+\.[^\s/]+/i.test(ref)) { fail(t().bad_ref); return; }   // an arXiv or Europe PMC id, a DOI, any web page's link
       if (!modelName) { fail(t().no_model); return; }   // connect a model first (the card below)
-      start(ref);
+      // queued: the box is free for the next link. A link that was refused (bad, no model) stays in it to be
+      // fixed; one the reader has already typed over while it waited is the reader's, and stays
+      if (await start(ref) && input.value.trim() === ref) input.value = '';
     };
     // a file, from the drop zone or dropped anywhere on the page: one the engine reads is converted (no model is
     // needed to read it); a Markdown or text file is stored by the server, then generated
@@ -1341,14 +1369,11 @@
     zone.title = [...ENGINE_EXT, ...TEXT_EXT].filter((x) => !['htm', 'mht', 'jpeg', 'tif', 'markdown', 'mdown'].includes(x)).map((x) => `.${x}`).join(' ');
     zone.onclick = () => fileIn.click();
     fileIn.onchange = () => { openFiles(fileIn.files); fileIn.value = ''; };   // (openFiles copies the list first)
-    let depth = 0;   // dragenter and dragleave fire for every child the file passes over
     const dropping = (on) => { zone.classList.toggle('dragging', on); document.getElementById('dropzone-t').textContent = on ? t().drop_md : t().drop_zone; };
-    document.addEventListener('dragenter', (e) => { if ([...e.dataTransfer.types].includes('Files')) { depth++; dropping(true); } });
-    document.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; dropping(false); } });
-    document.addEventListener('dragover', (e) => { if ([...e.dataTransfer.types].includes('Files')) e.preventDefault(); });
+    whileDragged(() => dropping(true), () => dropping(false));
     document.addEventListener('drop', (e) => {
       if (!e.dataTransfer.files.length) return;
-      e.preventDefault(); depth = 0; dropping(false);
+      e.preventDefault();
       openFiles(e.dataTransfer.files);
     });
     renderLanding();
@@ -1406,7 +1431,7 @@
       return cols.filter((c) => c.parent === parent).map((c) => {
         const kids = cols.some((x) => x.parent === c.key), open = opened.has(c.key);
         return `<li><div class="zl-col${c.key === col && !query ? ' on' : ''}" data-col="${esc(c.key)}">` +
-          `<button type="button" class="zl-tw" data-tw="${esc(c.key)}"${kids ? '' : ' disabled'}>${kids ? (open ? '▾' : '▸') : ''}</button>` +
+          `<button type="button" class="zl-tw${open ? ' open' : ''}" data-tw="${esc(c.key)}"${kids ? ` aria-expanded="${open}"` : ' disabled'}>${kids ? CHEV : ''}</button>` +
           `<span>${esc(c.name)}</span></div>${kids && open ? `<ul>${tree(c.key)}</ul>` : ''}</li>`;
       }).join('');
     }
@@ -1430,12 +1455,14 @@
     }
     function renderTree() { const n = q('.zl-tree'); if (!n) return; n.innerHTML = treeHtml(); wireTree(); }
     function wireTree() {
-      dlg.querySelectorAll('.zl-col').forEach((n) => { n.onclick = () => {
+      const twist = (key) => { if (opened.has(key)) opened.delete(key); else opened.add(key); renderTree(); };
+      dlg.querySelectorAll('.zl-col').forEach((n) => { n.onclick = (e) => {
+        // a double click opens or closes a collection that holds others, as in Zotero (the first click chose it)
+        if (e.detail === 2 && n.dataset.col && cols.some((c) => c.parent === n.dataset.col)) { twist(n.dataset.col); return; }
+        if (e.detail > 1) return;
         col = n.dataset.col; store.set(COL, col); query = ''; if (q('.zl-q')) q('.zl-q').value = ''; renderTree(); list();
       }; });
-      dlg.querySelectorAll('.zl-tw').forEach((b) => { b.onclick = (e) => {
-        e.stopPropagation(); if (opened.has(b.dataset.tw)) opened.delete(b.dataset.tw); else opened.add(b.dataset.tw); renderTree();
-      }; });
+      dlg.querySelectorAll('.zl-tw').forEach((b) => { b.onclick = (e) => { e.stopPropagation(); twist(b.dataset.tw); }; });
     }
     function renderItems() {
       const box = q('.zl-items');

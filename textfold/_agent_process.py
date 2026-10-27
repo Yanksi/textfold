@@ -37,6 +37,46 @@ class _WindowsJob:
             self.kernel.CloseHandle(self.handle)
             self.handle = None
 
+    def resume(self, process):
+        """Resume only this Popen's initial thread, after job assignment.
+
+        Popen closes CreateProcess's thread handle, so find it by the still-live,
+        suspended process ID. No other process's thread is opened or resumed.
+        """
+        import ctypes as c
+        from ctypes import wintypes as w
+        class Thread(c.Structure):
+            _fields_ = [("size", w.DWORD), ("usage", w.DWORD), ("id", w.DWORD),
+                        ("owner", w.DWORD), ("priority", w.LONG), ("delta", w.LONG), ("flags", w.DWORD)]
+        kernel = self.kernel
+        kernel.CreateToolhelp32Snapshot.argtypes = (w.DWORD, w.DWORD)
+        kernel.CreateToolhelp32Snapshot.restype = w.HANDLE
+        kernel.Thread32First.argtypes = kernel.Thread32Next.argtypes = (w.HANDLE, c.POINTER(Thread))
+        kernel.OpenThread.argtypes = (w.DWORD, w.BOOL, w.DWORD)
+        kernel.OpenThread.restype = w.HANDLE
+        kernel.ResumeThread.argtypes = (w.HANDLE,)
+        kernel.ResumeThread.restype = w.DWORD
+        snapshot = kernel.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+        if snapshot == w.HANDLE(-1).value:
+            raise c.WinError(c.get_last_error())
+        try:
+            thread = Thread(); thread.size = c.sizeof(thread)
+            found = kernel.Thread32First(snapshot, c.byref(thread))
+            while found:
+                if thread.owner == process.pid:
+                    handle = kernel.OpenThread(0x2, False, thread.id)  # THREAD_SUSPEND_RESUME
+                    if not handle: raise c.WinError(c.get_last_error())
+                    try:
+                        count = kernel.ResumeThread(handle)
+                        if count == 0xffffffff: raise c.WinError(c.get_last_error())
+                        if count == 1: return
+                    finally:
+                        kernel.CloseHandle(handle)
+                found = kernel.Thread32Next(snapshot, c.byref(thread))
+            raise RuntimeError("Could not resume the owned agent's suspended thread")
+        finally:
+            kernel.CloseHandle(snapshot)
+
 
 def run(args, *, stop, timeout, **kwargs):
     """communicate with polling cancellation; output completed before Stop is retained."""
@@ -44,7 +84,8 @@ def run(args, *, stop, timeout, **kwargs):
     if stop.is_set(): raise Stopped()
     body = kwargs.pop("input", None)
     windows = os.name == "nt"
-    flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if windows else {"start_new_session": True}
+    # CREATE_SUSPENDED prevents descendants escaping before AssignProcessToJobObject.
+    flags = {"creationflags": subprocess.CREATE_NO_WINDOW | 0x4} if windows else {"start_new_session": True}
     source = tempfile.TemporaryFile()
     try:
         source.write(body.encode(kwargs.get("encoding") or "utf-8") if isinstance(body, str) else body or b"")
@@ -55,7 +96,10 @@ def run(args, *, stop, timeout, **kwargs):
         raise
     job = None
     try:
-        if windows: job = _WindowsJob(process)
+        if windows:
+            job = _WindowsJob(process)
+            if stop.is_set(): raise Stopped()
+            job.resume(process)
         deadline = time.monotonic() + timeout
         while True:
             if stop.is_set() and process.poll() is None: raise Stopped()

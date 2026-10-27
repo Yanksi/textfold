@@ -4,11 +4,22 @@ A slow early chapter previously held up the visible progress count: the
 thread-pool iterator yielded in input order even after later sections completed.
 Generation and translation now count completion order. Translation still applies
 results in document order so its section/title choices stay deterministic.
+Both use upstream's `llm.as_answered`, including its periodic log while replies
+are outstanding; the PR adds cancellation propagation around that implementation.
 
 Codex requests from this TextFold process are serialized. Generation Stop reaches
 the active Codex runner and cancels queued calls before another subprocess starts.
 Only the created process tree is terminated: a Windows Job Object or a separate
 POSIX process group. There is no process-name search or shared bridge shutdown.
+On Windows the process starts suspended, joins its Job Object, then resumes;
+otherwise a quick launcher could create descendants before job assignment and
+leave them outside cancellation. A delayed-assignment regression covers this
+window, and setup failure or Stop during assignment never runs the child or
+leaves it suspended. The implementation uses documented
+[process creation flags](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags),
+[thread snapshots](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-thread32first)
+and [ResumeThread](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-resumethread),
+opening only threads owned by the new process.
 Prompts use a temporary input file so a child that does not read stdin cannot
 block cancellation. Completed replies returned before cancellation are still
 cached normally. Other agent/API runners retain their existing stop semantics.

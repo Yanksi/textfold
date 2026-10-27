@@ -13,6 +13,65 @@ from textfold import _agent_process, agents, llm
 
 class AgentCancellation(unittest.TestCase):
     def test_cancellation_closes_only_owned_tree_and_preserves_unrelated_process(self):
+        self.check_owned_tree()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows Job Object startup')
+    def test_cancellation_contains_children_started_during_job_assignment(self):
+        original = _agent_process._WindowsJob
+        def delayed_job(process):
+            time.sleep(1)  # widen Popen -> job assignment: no child may run yet
+            return original(process)
+        with mock.patch.object(_agent_process, '_WindowsJob', side_effect=delayed_job):
+            self.check_owned_tree()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows suspended startup')
+    def test_failed_job_assignment_or_resume_leaves_no_suspended_child(self):
+        original_job, original_popen = _agent_process._WindowsJob, subprocess.Popen
+        for stage in ('assignment', 'resume'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as folder:
+                marker, children = Path(folder) / 'unexpected', []
+                def spawn(*args, **kwargs):
+                    process = original_popen(*args, **kwargs)
+                    children.append(process)
+                    return process
+                def job(process):
+                    if stage == 'assignment': raise OSError('fixture setup failure')
+                    owned = original_job(process)
+                    owned.resume = mock.Mock(side_effect=OSError('fixture setup failure'))
+                    return owned
+                with mock.patch.object(_agent_process.subprocess, 'Popen', side_effect=spawn), \
+                        mock.patch.object(_agent_process, '_WindowsJob', side_effect=job):
+                    with self.assertRaisesRegex(OSError, 'fixture setup failure'):
+                        _agent_process.run([sys.executable, '-c', f'from pathlib import Path; Path({str(marker)!r}).touch()'],
+                                           stop=threading.Event(), timeout=5, text=True, encoding='utf-8')
+                self.assertEqual(len(children), 1)
+                self.assertIsNotNone(children[0].poll(), 'failed startup left a suspended child')
+                self.assertFalse(marker.exists(), 'agent ran before its job was ready')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows suspended startup')
+    def test_stop_during_job_assignment_never_resumes_the_child(self):
+        original_job, original_popen = _agent_process._WindowsJob, subprocess.Popen
+        stop, children = threading.Event(), []
+        def spawn(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            children.append(process)
+            return process
+        def job(process):
+            owned = original_job(process)
+            stop.set()
+            return owned
+        with tempfile.TemporaryDirectory() as folder:
+            marker = Path(folder) / 'unexpected'
+            with mock.patch.object(_agent_process.subprocess, 'Popen', side_effect=spawn), \
+                    mock.patch.object(_agent_process, '_WindowsJob', side_effect=job):
+                with self.assertRaises(llm.Stopped):
+                    _agent_process.run([sys.executable, '-c', f'from pathlib import Path; Path({str(marker)!r}).touch()'],
+                                       stop=stop, timeout=5, text=True, encoding='utf-8')
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+            self.assertFalse(marker.exists())
+
+    def check_owned_tree(self):
         with tempfile.TemporaryDirectory() as root:
             root=Path(root); ready=root/'ready'; late=root/'late'
             survivor=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

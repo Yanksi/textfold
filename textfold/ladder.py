@@ -16,7 +16,7 @@ One model call per chunk (a heading and the units under it).
 import bisect
 import difflib
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from . import kinds, langs, llm
 from .tokens import is_cjk, lcs_pairs, norm, plain, tokenize_text, words
@@ -727,9 +727,8 @@ def build(doc, cfg, cache_dir, jobs=4, log=print, progress=None, force=False, st
 
     if progress:
         progress(0, len(chunks))
-    with ThreadPoolExecutor(jobs) as ex:
-        for n_done, future in enumerate(as_completed([ex.submit(run, c) for c in chunks]), 1):
-            c, res, err = future.result()
+    with ThreadPoolExecutor(jobs) as ex:   # (each section as its reply comes: what is done with one reads only its own)
+        for n_done, (c, res, err) in enumerate(llm.as_answered(ex, run, chunks, log, model), 1):
             if progress:
                 progress(n_done, len(chunks))
             if stop is not None and stop.is_set():
